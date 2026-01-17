@@ -1,6 +1,6 @@
 //! Main GraphQL Security Agent implementation.
 //!
-//! Coordinates all analyzers and integrates with the Sentinel Agent SDK.
+//! Coordinates all analyzers and integrates with the Sentinel Agent Protocol v2.
 
 use crate::analyzer::{
     AliasAnalyzer, AnalysisContext, AnalysisMetrics, AnalysisResult, Analyzer, BatchAnalyzer,
@@ -11,25 +11,48 @@ use crate::config::{FailAction, GraphQLSecurityConfig};
 use crate::error::{graphql_error_response, GraphQLError, Violation};
 use crate::parser::{parse_query, parse_request};
 use async_trait::async_trait;
-use sentinel_agent_sdk::{Agent, Decision, Request};
+use sentinel_agent_protocol::v2::{
+    AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, DrainReason, HealthConfig,
+    HealthStatus, MetricsReport, ShutdownReason,
+};
+use sentinel_agent_protocol::{
+    AgentResponse, Decision, EventType, HeaderOp, RequestHeadersEvent, PROTOCOL_VERSION,
+};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// GraphQL Security Agent for Sentinel.
 ///
 /// Analyzes GraphQL queries for security concerns including depth, complexity,
 /// aliases, batch limits, introspection, field authorization, and persisted queries.
+///
+/// Implements Protocol v2 with capability negotiation, health reporting, and metrics.
 pub struct GraphQLSecurityAgent {
-    config: GraphQLSecurityConfig,
+    /// Agent configuration
+    config: RwLock<GraphQLSecurityConfig>,
     /// Active analyzers
-    analyzers: Vec<Arc<dyn Analyzer>>,
+    analyzers: RwLock<Vec<Arc<dyn Analyzer>>>,
+    /// Request counters for metrics
+    requests_total: AtomicU64,
+    requests_blocked: AtomicU64,
+    /// Configuration version
+    config_version: RwLock<Option<String>>,
 }
 
 impl GraphQLSecurityAgent {
     /// Create a new GraphQL security agent with the given configuration.
     pub fn new(config: GraphQLSecurityConfig) -> Result<Self, GraphQLError> {
         let analyzers = Self::build_analyzers(&config);
-        Ok(Self { config, analyzers })
+        Ok(Self {
+            config: RwLock::new(config),
+            analyzers: RwLock::new(analyzers),
+            requests_total: AtomicU64::new(0),
+            requests_blocked: AtomicU64::new(0),
+            config_version: RwLock::new(None),
+        })
     }
 
     /// Create agent with async initialization (for loading allowlist files).
@@ -69,7 +92,13 @@ impl GraphQLSecurityAgent {
             analyzers.push(Arc::new(persisted_analyzer));
         }
 
-        Ok(Self { config, analyzers })
+        Ok(Self {
+            config: RwLock::new(config),
+            analyzers: RwLock::new(analyzers),
+            requests_total: AtomicU64::new(0),
+            requests_blocked: AtomicU64::new(0),
+            config_version: RwLock::new(None),
+        })
     }
 
     /// Build analyzers from configuration (sync version).
@@ -112,19 +141,49 @@ impl GraphQLSecurityAgent {
     }
 
     /// Analyze a GraphQL request.
-    fn analyze_request_sync(
+    ///
+    /// This method reads the config and analyzers first, then performs the analysis
+    /// synchronously to avoid holding non-Send types (ParsedDocument) across await points.
+    async fn analyze_request(
         &self,
         body: &[u8],
-        headers: &std::collections::HashMap<String, Vec<String>>,
+        headers: &HashMap<String, Vec<String>>,
         correlation_id: &str,
         client_ip: &str,
     ) -> Result<AnalysisResult, Violation> {
+        // Read config and analyzers before synchronous analysis
+        let max_body_size = {
+            let config = self.config.read().await;
+            config.settings.max_body_size
+        };
+
+        // Get a snapshot of analyzers
+        let analyzers: Vec<Arc<dyn Analyzer>> = {
+            let analyzers_guard = self.analyzers.read().await;
+            analyzers_guard.clone()
+        };
+
+        // Now perform the synchronous analysis without holding any locks
+        Self::analyze_request_sync(body, headers, correlation_id, client_ip, max_body_size, &analyzers)
+    }
+
+    /// Synchronous analysis implementation.
+    ///
+    /// Separated to avoid holding non-Send ParsedDocument across await points.
+    fn analyze_request_sync(
+        body: &[u8],
+        headers: &HashMap<String, Vec<String>>,
+        correlation_id: &str,
+        client_ip: &str,
+        max_body_size: usize,
+        analyzers: &[Arc<dyn Analyzer>],
+    ) -> Result<AnalysisResult, Violation> {
         // Check body size
-        if body.len() > self.config.settings.max_body_size {
+        if body.len() > max_body_size {
             return Err(Violation::invalid_request(&format!(
                 "Request body too large: {} bytes (max: {})",
                 body.len(),
-                self.config.settings.max_body_size
+                max_body_size
             )));
         }
 
@@ -158,7 +217,7 @@ impl GraphQLSecurityAgent {
             // Run all analyzers synchronously using block_on
             // This is necessary because the Analyzer trait is async but we want
             // to avoid Send/Sync issues with the ParsedDocument
-            for analyzer in &self.analyzers {
+            for analyzer in analyzers.iter() {
                 let result = futures::executor::block_on(analyzer.analyze(&document, &ctx));
                 combined_result.merge(result);
             }
@@ -167,111 +226,240 @@ impl GraphQLSecurityAgent {
         Ok(combined_result)
     }
 
-    /// Build decision with debug headers if enabled.
-    fn build_block_decision(&self, violations: &[Violation], metrics: &AnalysisMetrics) -> Decision {
+    /// Build block response with GraphQL error body.
+    fn build_block_response(
+        &self,
+        violations: &[Violation],
+        metrics: &AnalysisMetrics,
+        debug_headers: bool,
+    ) -> AgentResponse {
         let error_body = graphql_error_response(violations);
         let body_str = serde_json::to_string(&error_body).unwrap_or_default();
 
-        let mut decision = Decision::block(200)
-            .with_body(&body_str)
-            .add_response_header("Content-Type", "application/json");
+        let mut response_headers = vec![HeaderOp::Set {
+            name: "Content-Type".to_string(),
+            value: "application/json".to_string(),
+        }];
 
         // Add debug headers if enabled
-        if self.config.settings.debug_headers {
-            decision = self.add_debug_headers(decision, metrics);
+        if debug_headers {
+            self.add_debug_headers(&mut response_headers, metrics);
         }
 
-        decision
+        AgentResponse {
+            version: PROTOCOL_VERSION,
+            decision: Decision::Block {
+                status: 200, // GraphQL errors use HTTP 200 with errors in body
+                body: Some(body_str),
+                headers: None,
+            },
+            request_headers: vec![],
+            response_headers,
+            routing_metadata: HashMap::new(),
+            audit: Default::default(),
+            needs_more: false,
+            request_body_mutation: None,
+            response_body_mutation: None,
+            websocket_decision: None,
+        }
     }
 
-    /// Add debug headers to a decision.
-    fn add_debug_headers(&self, mut decision: Decision, metrics: &AnalysisMetrics) -> Decision {
+    /// Build allow response with optional debug headers.
+    fn build_allow_response(&self, metrics: &AnalysisMetrics, debug_headers: bool) -> AgentResponse {
+        let mut response_headers = vec![];
+
+        if debug_headers {
+            self.add_debug_headers(&mut response_headers, metrics);
+        }
+
+        AgentResponse {
+            version: PROTOCOL_VERSION,
+            decision: Decision::Allow,
+            request_headers: vec![],
+            response_headers,
+            routing_metadata: HashMap::new(),
+            audit: Default::default(),
+            needs_more: false,
+            request_body_mutation: None,
+            response_body_mutation: None,
+            websocket_decision: None,
+        }
+    }
+
+    /// Add debug headers to response.
+    fn add_debug_headers(&self, headers: &mut Vec<HeaderOp>, metrics: &AnalysisMetrics) {
         if let Some(depth) = metrics.depth {
-            decision = decision.add_response_header("X-GraphQL-Depth", &depth.to_string());
+            headers.push(HeaderOp::Set {
+                name: "X-GraphQL-Depth".to_string(),
+                value: depth.to_string(),
+            });
         }
         if let Some(complexity) = metrics.complexity {
-            decision = decision.add_response_header("X-GraphQL-Complexity", &complexity.to_string());
+            headers.push(HeaderOp::Set {
+                name: "X-GraphQL-Complexity".to_string(),
+                value: complexity.to_string(),
+            });
         }
         if let Some(aliases) = metrics.aliases {
-            decision = decision.add_response_header("X-GraphQL-Aliases", &aliases.to_string());
+            headers.push(HeaderOp::Set {
+                name: "X-GraphQL-Aliases".to_string(),
+                value: aliases.to_string(),
+            });
         }
         if let Some(operations) = metrics.operations {
-            decision = decision.add_response_header("X-GraphQL-Operations", &operations.to_string());
+            headers.push(HeaderOp::Set {
+                name: "X-GraphQL-Operations".to_string(),
+                value: operations.to_string(),
+            });
         }
         if let Some(fields) = metrics.fields {
-            decision = decision.add_response_header("X-GraphQL-Fields", &fields.to_string());
+            headers.push(HeaderOp::Set {
+                name: "X-GraphQL-Fields".to_string(),
+                value: fields.to_string(),
+            });
         }
-        decision
     }
 }
 
+/// Protocol v2 implementation
 #[async_trait]
-impl Agent for GraphQLSecurityAgent {
-    fn name(&self) -> &str {
-        "graphql-security"
+impl AgentHandlerV2 for GraphQLSecurityAgent {
+    /// Return agent capabilities for protocol negotiation.
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            protocol_version: 2,
+            agent_id: "graphql-security".to_string(),
+            name: "GraphQL Security Agent".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            supported_events: vec![
+                EventType::RequestHeaders,
+                EventType::RequestBodyChunk,
+                EventType::Configure,
+            ],
+            features: AgentFeatures {
+                streaming_body: false, // We need full body for GraphQL parsing
+                websocket: false,
+                guardrails: false,
+                config_push: true,
+                metrics_export: true,
+                concurrent_requests: 100,
+                cancellation: true,
+                flow_control: false,
+                health_reporting: true,
+            },
+            limits: AgentLimits {
+                max_body_size: 10 * 1024 * 1024, // 10MB
+                max_concurrency: 100,
+                preferred_chunk_size: 64 * 1024,
+                max_memory: None,
+                max_processing_time_ms: Some(5000),
+            },
+            health: HealthConfig {
+                report_interval_ms: 10_000,
+                include_load_metrics: true,
+                include_resource_metrics: false,
+            },
+        }
     }
 
-    async fn on_request(&self, request: &Request) -> Decision {
-        let correlation_id = request
-            .header("x-correlation-id")
-            .or_else(|| request.header("x-request-id"))
-            .unwrap_or("unknown")
-            .to_string();
+    /// Handle request headers event - this is where GraphQL requests are analyzed.
+    async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
 
-        let client_ip = request.client_ip().to_string();
+        let correlation_id = event.metadata.correlation_id.clone();
+        let client_ip = event.metadata.client_ip.clone();
 
         debug!(
             correlation_id = %correlation_id,
             client_ip = %client_ip,
-            method = %request.method(),
-            path = %request.path(),
+            method = %event.method,
+            uri = %event.uri,
             "Processing GraphQL request"
         );
 
-        // Get body - if not available yet, allow through
-        let body = match request.body() {
+        // For GraphQL, we need the body. Signal that we need more data.
+        // The actual analysis will happen in on_request_body_chunk with is_last=true
+        AgentResponse {
+            version: PROTOCOL_VERSION,
+            decision: Decision::Allow,
+            request_headers: vec![],
+            response_headers: vec![],
+            routing_metadata: HashMap::new(),
+            audit: Default::default(),
+            needs_more: true, // Signal we need the body
+            request_body_mutation: None,
+            response_body_mutation: None,
+            websocket_decision: None,
+        }
+    }
+
+    /// Handle request body chunk - analyze the GraphQL query when body is complete.
+    async fn on_request_body_chunk(
+        &self,
+        event: sentinel_agent_protocol::RequestBodyChunkEvent,
+    ) -> AgentResponse {
+        // Only process when we have the complete body
+        if !event.is_last {
+            return AgentResponse {
+                version: PROTOCOL_VERSION,
+                decision: Decision::Allow,
+                request_headers: vec![],
+                response_headers: vec![],
+                routing_metadata: HashMap::new(),
+                audit: Default::default(),
+                needs_more: true,
+                request_body_mutation: None,
+                response_body_mutation: None,
+                websocket_decision: None,
+            };
+        }
+
+        let correlation_id = event.correlation_id.clone();
+
+        // Decode the base64 body
+        let body = match base64_decode(&event.data) {
             Some(b) => b,
             None => {
-                debug!(
-                    correlation_id = %correlation_id,
-                    "No body available, passing through"
-                );
-                return Decision::allow();
+                warn!(correlation_id = %correlation_id, "Failed to decode request body");
+                return AgentResponse::default_allow();
             }
         };
 
-        // Convert headers
-        let headers = request.headers().clone();
+        // Get config for this request
+        let config = self.config.read().await;
+        let debug_headers = config.settings.debug_headers;
+        let fail_action = config.settings.fail_action;
+        drop(config);
 
         // Analyze the request
-        let result = self.analyze_request_sync(body, &headers, &correlation_id, &client_ip);
+        let headers = HashMap::new(); // Headers were in the previous event
+        let result = self
+            .analyze_request(&body, &headers, &correlation_id, "unknown")
+            .await;
 
         match result {
             Ok(analysis_result) => {
                 if analysis_result.has_violations() {
+                    self.requests_blocked.fetch_add(1, Ordering::Relaxed);
+
                     warn!(
                         correlation_id = %correlation_id,
                         violation_count = analysis_result.violations.len(),
                         "GraphQL security violations detected"
                     );
 
-                    match self.config.settings.fail_action {
-                        FailAction::Block => {
-                            self.build_block_decision(
-                                &analysis_result.violations,
-                                &analysis_result.metrics,
-                            )
-                        }
+                    match fail_action {
+                        FailAction::Block => self.build_block_response(
+                            &analysis_result.violations,
+                            &analysis_result.metrics,
+                            debug_headers,
+                        ),
                         FailAction::Allow => {
                             info!(
                                 correlation_id = %correlation_id,
                                 "Violations detected but allowing request (fail_action=allow)"
                             );
-                            let mut decision = Decision::allow();
-                            if self.config.settings.debug_headers {
-                                decision = self.add_debug_headers(decision, &analysis_result.metrics);
-                            }
-                            decision
+                            self.build_allow_response(&analysis_result.metrics, debug_headers)
                         }
                     }
                 } else {
@@ -279,14 +467,12 @@ impl Agent for GraphQLSecurityAgent {
                         correlation_id = %correlation_id,
                         "GraphQL request passed security checks"
                     );
-                    let mut decision = Decision::allow();
-                    if self.config.settings.debug_headers {
-                        decision = self.add_debug_headers(decision, &analysis_result.metrics);
-                    }
-                    decision
+                    self.build_allow_response(&analysis_result.metrics, debug_headers)
                 }
             }
             Err(violation) => {
+                self.requests_blocked.fetch_add(1, Ordering::Relaxed);
+
                 warn!(
                     correlation_id = %correlation_id,
                     code = %violation.code,
@@ -294,32 +480,117 @@ impl Agent for GraphQLSecurityAgent {
                     "GraphQL request error"
                 );
 
-                match self.config.settings.fail_action {
+                match fail_action {
                     FailAction::Block => {
-                        self.build_block_decision(&[violation], &AnalysisMetrics::default())
+                        self.build_block_response(&[violation], &AnalysisMetrics::default(), debug_headers)
                     }
                     FailAction::Allow => {
                         info!(
                             correlation_id = %correlation_id,
                             "Error occurred but allowing request (fail_action=allow)"
                         );
-                        Decision::allow()
+                        AgentResponse::default_allow()
                     }
                 }
             }
         }
     }
 
-    async fn on_request_body(&self, request: &Request) -> Decision {
-        // Process in on_request_body since we need the body
-        self.on_request(request).await
+    /// Handle configuration updates from the proxy.
+    async fn on_configure(&self, config: serde_json::Value, version: Option<String>) -> bool {
+        info!("Received configuration update, version: {:?}", version);
+
+        // Try to parse the new configuration
+        match serde_json::from_value::<GraphQLSecurityConfig>(config) {
+            Ok(new_config) => {
+                // Rebuild analyzers with new config
+                let new_analyzers = Self::build_analyzers(&new_config);
+
+                // Update config and analyzers atomically
+                *self.config.write().await = new_config;
+                *self.analyzers.write().await = new_analyzers;
+                *self.config_version.write().await = version;
+
+                info!("Configuration updated successfully");
+                true
+            }
+            Err(e) => {
+                warn!("Failed to parse configuration: {}", e);
+                false
+            }
+        }
     }
+
+    /// Return current health status.
+    fn health_status(&self) -> HealthStatus {
+        HealthStatus::healthy("graphql-security")
+    }
+
+    /// Return metrics report for the proxy.
+    fn metrics_report(&self) -> Option<MetricsReport> {
+        use sentinel_agent_protocol::v2::{CounterMetric, GaugeMetric};
+
+        let requests = self.requests_total.load(Ordering::Relaxed);
+        let blocked = self.requests_blocked.load(Ordering::Relaxed);
+
+        let mut report = MetricsReport::new("graphql-security", 10_000);
+
+        report.counters.push(CounterMetric::new(
+            "graphql_security_requests_total",
+            requests,
+        ));
+        report.counters.push(CounterMetric::new(
+            "graphql_security_requests_blocked_total",
+            blocked,
+        ));
+
+        // Calculate block rate
+        let block_rate = if requests > 0 {
+            (blocked as f64 / requests as f64) * 100.0
+        } else {
+            0.0
+        };
+        report.gauges.push(GaugeMetric::new(
+            "graphql_security_block_rate_percent",
+            block_rate,
+        ));
+
+        Some(report)
+    }
+
+    /// Handle shutdown request.
+    async fn on_shutdown(&self, reason: ShutdownReason, grace_period_ms: u64) {
+        info!(
+            "Shutdown requested: {:?}, grace period: {}ms",
+            reason, grace_period_ms
+        );
+        // Agent will be stopped by the runner
+    }
+
+    /// Handle drain request.
+    async fn on_drain(&self, duration_ms: u64, reason: DrainReason) {
+        info!(
+            "Drain requested: {:?}, duration: {}ms",
+            reason, duration_ms
+        );
+        // Stop accepting new requests
+    }
+}
+
+/// Decode base64 string to bytes
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let bytes = s.as_bytes();
+    let mut decoder =
+        base64::read::DecoderReader::new(bytes, &base64::engine::general_purpose::STANDARD);
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).ok()?;
+    Some(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn test_config() -> GraphQLSecurityConfig {
         GraphQLSecurityConfig {
@@ -336,9 +607,44 @@ mod tests {
             complexity: crate::config::ComplexityConfig {
                 enabled: true,
                 max_complexity: 100,
-                ..Default::default()
+                default_field_cost: 1,
+                default_list_multiplier: 10,
+                type_costs: HashMap::new(),
+                field_costs: HashMap::new(),
+                list_size_arguments: vec![
+                    "first".to_string(),
+                    "last".to_string(),
+                    "limit".to_string(),
+                    "pageSize".to_string(),
+                ],
             },
-            ..Default::default()
+            aliases: crate::config::AliasConfig {
+                enabled: true,
+                max_aliases: 10,
+                max_duplicate_aliases: 3,
+            },
+            batch: crate::config::BatchConfig {
+                enabled: true,
+                max_queries: 5,
+            },
+            introspection: crate::config::IntrospectionConfig {
+                enabled: true,
+                allow: false,
+                allowed_clients: Vec::new(),
+                allowed_clients_header: None,
+                allow_typename: true,
+            },
+            field_auth: crate::config::FieldAuthConfig {
+                enabled: false,
+                rules: Vec::new(),
+            },
+            persisted_queries: crate::config::PersistedQueriesConfig {
+                enabled: false,
+                mode: crate::config::PersistedQueryMode::Allowlist,
+                allowlist_file: None,
+                require_hash: false,
+            },
+            version: "1".to_string(),
         }
     }
 
@@ -348,51 +654,91 @@ mod tests {
         assert!(agent.is_ok());
     }
 
-    #[test]
-    fn test_analyze_valid_query() {
+    #[tokio::test]
+    async fn test_analyze_valid_query() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
         let body = br#"{"query": "{ users { id name } }"}"#;
         let headers = HashMap::new();
 
-        let result = agent.analyze_request_sync(body, &headers, "test", "127.0.0.1");
+        let result = agent
+            .analyze_request(body, &headers, "test", "127.0.0.1")
+            .await;
 
         assert!(result.is_ok());
         assert!(!result.unwrap().has_violations());
     }
 
-    #[test]
-    fn test_analyze_depth_exceeded() {
+    #[tokio::test]
+    async fn test_analyze_depth_exceeded() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
         let body = br#"{"query": "{ a { b { c { d { e { f { g } } } } } } }"}"#;
         let headers = HashMap::new();
 
-        let result = agent.analyze_request_sync(body, &headers, "test", "127.0.0.1");
+        let result = agent
+            .analyze_request(body, &headers, "test", "127.0.0.1")
+            .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().has_violations());
     }
 
-    #[test]
-    fn test_analyze_invalid_json() {
+    #[tokio::test]
+    async fn test_analyze_invalid_json() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
         let body = b"not json";
         let headers = HashMap::new();
 
-        let result = agent.analyze_request_sync(body, &headers, "test", "127.0.0.1");
+        let result = agent
+            .analyze_request(body, &headers, "test", "127.0.0.1")
+            .await;
 
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_body_size_limit() {
+    #[tokio::test]
+    async fn test_body_size_limit() {
         let mut config = test_config();
         config.settings.max_body_size = 10;
         let agent = GraphQLSecurityAgent::new(config).unwrap();
         let body = br#"{"query": "{ users { id name email } }"}"#;
         let headers = HashMap::new();
 
-        let result = agent.analyze_request_sync(body, &headers, "test", "127.0.0.1");
+        let result = agent
+            .analyze_request(body, &headers, "test", "127.0.0.1")
+            .await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_capabilities() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        let caps = agent.capabilities();
+
+        assert_eq!(caps.agent_id, "graphql-security");
+        assert_eq!(caps.protocol_version, 2);
+        assert!(caps.features.config_push);
+        assert!(caps.features.metrics_export);
+        assert!(caps.features.health_reporting);
+    }
+
+    #[test]
+    fn test_health_status() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        let health = agent.health_status();
+
+        assert!(health.is_healthy());
+        assert_eq!(health.agent_id, "graphql-security");
+    }
+
+    #[test]
+    fn test_metrics_report() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        let report = agent.metrics_report();
+
+        assert!(report.is_some());
+        let report = report.unwrap();
+        assert_eq!(report.agent_id, "graphql-security");
+        assert!(!report.counters.is_empty());
     }
 }

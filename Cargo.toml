@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-agent-graphql-security"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Raskell <hello@raskell.io>"]
 description = "GraphQL security agent for Sentinel proxy - query depth, complexity, and introspection control"
@@ -11,8 +11,9 @@ categories = ["network-programming", "web-programming"]
 readme = "README.md"
 
 [dependencies]
-# Sentinel SDK
+# Sentinel SDK and Protocol
 sentinel-agent-sdk = "0.1"
+sentinel-agent-protocol = "0.3"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
@@ -40,6 +41,9 @@ apollo-parser = "0.8"
 # Hashing for persisted queries
 sha2 = "0.10"
 hex = "0.4"
+
+# Base64 encoding/decoding
+base64 = "0.22"
 
 # Pattern matching for field auth rules
 glob = "0.3"
