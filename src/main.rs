@@ -1,6 +1,6 @@
-//! Sentinel GraphQL Security Agent binary (Protocol v2).
+//! Zentinel GraphQL Security Agent binary (Protocol v2).
 //!
-//! Run with: `sentinel-agent-graphql-security --config config.yaml`
+//! Run with: `zentinel-agent-graphql-security --config config.yaml`
 //!
 //! Supports gRPC transport for v2 protocol:
 //! - gRPC: `--grpc-address 0.0.0.0:50051` (recommended for v2 features)
@@ -8,13 +8,13 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sentinel_agent_graphql_security::{GraphQLSecurityAgent, GraphQLSecurityConfig};
-use sentinel_agent_protocol::v2::GrpcAgentServerV2;
+use zentinel_agent_graphql_security::{GraphQLSecurityAgent, GraphQLSecurityConfig};
+use zentinel_agent_protocol::v2::GrpcAgentServerV2;
 use std::path::PathBuf;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-/// GraphQL Security Agent for Sentinel proxy (Protocol v2).
+/// GraphQL Security Agent for Zentinel proxy (Protocol v2).
 ///
 /// This agent analyzes GraphQL queries for security concerns including:
 /// - Query depth limiting
@@ -32,7 +32,7 @@ struct Args {
     config: PathBuf,
 
     /// Unix socket path for agent communication (v1 compatibility mode)
-    #[arg(short, long, default_value = "/tmp/sentinel-graphql-security.sock")]
+    #[arg(short, long, default_value = "/tmp/zentinel-graphql-security.sock")]
     socket: PathBuf,
 
     /// gRPC address for agent communication (e.g., 0.0.0.0:50051)
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
         .context("Failed to set tracing subscriber")?;
 
     info!(
-        "Starting Sentinel GraphQL Security Agent v{}",
+        "Starting Zentinel GraphQL Security Agent v{}",
         env!("CARGO_PKG_VERSION")
     );
     info!("Protocol version: v2");
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
         // Create a v1 UDS server with an adapter
         // Note: We wrap the v2 handler in a v1-compatible adapter
         let adapter = V2ToV1Adapter::new(agent);
-        let server = sentinel_agent_protocol::AgentServer::new(
+        let server = zentinel_agent_protocol::AgentServer::new(
             "graphql-security",
             &args.socket,
             Box::new(adapter),
@@ -175,19 +175,19 @@ impl V2ToV1Adapter {
 }
 
 #[async_trait::async_trait]
-impl sentinel_agent_protocol::AgentHandler for V2ToV1Adapter {
+impl zentinel_agent_protocol::AgentHandler for V2ToV1Adapter {
     async fn on_configure(
         &self,
-        event: sentinel_agent_protocol::ConfigureEvent,
-    ) -> sentinel_agent_protocol::AgentResponse {
-        use sentinel_agent_protocol::v2::AgentHandlerV2;
+        event: zentinel_agent_protocol::ConfigureEvent,
+    ) -> zentinel_agent_protocol::AgentResponse {
+        use zentinel_agent_protocol::v2::AgentHandlerV2;
         let success = self.handler.on_configure(event.config, None).await;
         if success {
-            sentinel_agent_protocol::AgentResponse::default_allow()
+            zentinel_agent_protocol::AgentResponse::default_allow()
         } else {
-            sentinel_agent_protocol::AgentResponse {
-                version: sentinel_agent_protocol::PROTOCOL_VERSION,
-                decision: sentinel_agent_protocol::Decision::Block {
+            zentinel_agent_protocol::AgentResponse {
+                version: zentinel_agent_protocol::PROTOCOL_VERSION,
+                decision: zentinel_agent_protocol::Decision::Block {
                     status: 500,
                     body: Some("Configuration rejected".to_string()),
                     headers: None,
@@ -206,41 +206,41 @@ impl sentinel_agent_protocol::AgentHandler for V2ToV1Adapter {
 
     async fn on_request_headers(
         &self,
-        event: sentinel_agent_protocol::RequestHeadersEvent,
-    ) -> sentinel_agent_protocol::AgentResponse {
-        use sentinel_agent_protocol::v2::AgentHandlerV2;
+        event: zentinel_agent_protocol::RequestHeadersEvent,
+    ) -> zentinel_agent_protocol::AgentResponse {
+        use zentinel_agent_protocol::v2::AgentHandlerV2;
         self.handler.on_request_headers(event).await
     }
 
     async fn on_request_body_chunk(
         &self,
-        event: sentinel_agent_protocol::RequestBodyChunkEvent,
-    ) -> sentinel_agent_protocol::AgentResponse {
-        use sentinel_agent_protocol::v2::AgentHandlerV2;
+        event: zentinel_agent_protocol::RequestBodyChunkEvent,
+    ) -> zentinel_agent_protocol::AgentResponse {
+        use zentinel_agent_protocol::v2::AgentHandlerV2;
         self.handler.on_request_body_chunk(event).await
     }
 
     async fn on_response_headers(
         &self,
-        event: sentinel_agent_protocol::ResponseHeadersEvent,
-    ) -> sentinel_agent_protocol::AgentResponse {
-        use sentinel_agent_protocol::v2::AgentHandlerV2;
+        event: zentinel_agent_protocol::ResponseHeadersEvent,
+    ) -> zentinel_agent_protocol::AgentResponse {
+        use zentinel_agent_protocol::v2::AgentHandlerV2;
         self.handler.on_response_headers(event).await
     }
 
     async fn on_response_body_chunk(
         &self,
-        event: sentinel_agent_protocol::ResponseBodyChunkEvent,
-    ) -> sentinel_agent_protocol::AgentResponse {
-        use sentinel_agent_protocol::v2::AgentHandlerV2;
+        event: zentinel_agent_protocol::ResponseBodyChunkEvent,
+    ) -> zentinel_agent_protocol::AgentResponse {
+        use zentinel_agent_protocol::v2::AgentHandlerV2;
         self.handler.on_response_body_chunk(event).await
     }
 
     async fn on_request_complete(
         &self,
-        event: sentinel_agent_protocol::RequestCompleteEvent,
-    ) -> sentinel_agent_protocol::AgentResponse {
-        use sentinel_agent_protocol::v2::AgentHandlerV2;
+        event: zentinel_agent_protocol::RequestCompleteEvent,
+    ) -> zentinel_agent_protocol::AgentResponse {
+        use zentinel_agent_protocol::v2::AgentHandlerV2;
         self.handler.on_request_complete(event).await
     }
 }

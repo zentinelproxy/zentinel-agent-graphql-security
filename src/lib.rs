@@ -1,4 +1,4 @@
-//! GraphQL Security Agent for Sentinel
+//! GraphQL Security Agent for Zentinel
 //!
 //! Provides GraphQL-specific security controls including query depth limiting,
 //! complexity analysis, introspection control, and field-level authorization.
@@ -16,8 +16,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use sentinel_agent_graphql_security::GraphQLSecurityAgent;
-//! use sentinel_agent_sdk::AgentRunner;
+//! use zentinel_agent_graphql_security::GraphQLSecurityAgent;
+//! use zentinel_agent_sdk::AgentRunner;
 //!
 //! let agent = GraphQLSecurityAgent::new(config)?;
 //! AgentRunner::new(agent)

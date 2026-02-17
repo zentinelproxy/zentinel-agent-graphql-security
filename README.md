@@ -1,16 +1,16 @@
-# sentinel-agent-graphql-security
+# zentinel-agent-graphql-security
 
-GraphQL security agent for Sentinel reverse proxy - query depth limiting, introspection control, and cost analysis.
+GraphQL security agent for Zentinel reverse proxy - query depth limiting, introspection control, and cost analysis.
 
 ## Installation
 
 ```bash
-cargo install sentinel-agent-graphql-security
+cargo install zentinel-agent-graphql-security
 ```
 
 ## Documentation
 
-See [sentinel.raskell.io/docs/agents/graphql-security](https://sentinel.raskell.io/docs/agents/graphql-security)
+See [zentinelproxy.io/docs/agents/graphql-security](https://zentinelproxy.io/docs/agents/graphql-security)
 
 ## License
 

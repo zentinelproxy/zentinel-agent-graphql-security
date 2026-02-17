@@ -246,7 +246,7 @@ pub fn graphql_error_response(violations: &[Violation]) -> Value {
                 "message": v.message,
                 "extensions": {
                     "code": v.code.as_str(),
-                    "sentinel": true
+                    "zentinel": true
                 }
             });
 
@@ -307,7 +307,7 @@ mod tests {
         let error = &errors[0];
         assert!(error["message"].as_str().unwrap().contains("depth"));
         assert_eq!(error["extensions"]["code"], "DEPTH_EXCEEDED");
-        assert_eq!(error["extensions"]["sentinel"], true);
+        assert_eq!(error["extensions"]["zentinel"], true);
         assert_eq!(error["extensions"]["actual"], 15);
         assert_eq!(error["extensions"]["max"], 10);
     }

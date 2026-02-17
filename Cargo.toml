@@ -1,19 +1,19 @@
 [package]
-name = "sentinel-agent-graphql-security"
+name = "zentinel-agent-graphql-security"
 version = "0.2.0"
 edition = "2021"
 authors = ["Raskell <hello@raskell.io>"]
-description = "GraphQL security agent for Sentinel proxy - query depth, complexity, and introspection control"
+description = "GraphQL security agent for Zentinel proxy - query depth, complexity, and introspection control"
 license = "Apache-2.0"
-repository = "https://github.com/raskell-io/sentinel-agent-graphql-security"
-keywords = ["sentinel", "proxy", "agent", "graphql", "security"]
+repository = "https://github.com/zentinelproxy/zentinel-agent-graphql-security"
+keywords = ["zentinel", "proxy", "agent", "graphql", "security"]
 categories = ["network-programming", "web-programming"]
 readme = "README.md"
 
 [dependencies]
-# Sentinel SDK and Protocol
-sentinel-agent-sdk = "0.1"
-sentinel-agent-protocol = "0.3"
+# Zentinel SDK and Protocol
+zentinel-agent-sdk = "0.1"
+zentinel-agent-protocol = "0.3"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
@@ -56,9 +56,9 @@ tokio-test = "0.4"
 tempfile = "3"
 
 [[bin]]
-name = "sentinel-agent-graphql-security"
+name = "zentinel-agent-graphql-security"
 path = "src/main.rs"
 
 [lib]
-name = "sentinel_agent_graphql_security"
+name = "zentinel_agent_graphql_security"
 path = "src/lib.rs"

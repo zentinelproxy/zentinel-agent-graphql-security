@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-# Sentinel GraphQL Security Agent Container Image
+# Zentinel GraphQL Security Agent Container Image
 #
 # Targets:
 #   - prebuilt: For CI with pre-built binaries
@@ -10,16 +10,16 @@
 ################################################################################
 FROM gcr.io/distroless/cc-debian12:nonroot AS prebuilt
 
-COPY sentinel-agent-graphql-security /sentinel-agent-graphql-security
+COPY zentinel-agent-graphql-security /zentinel-agent-graphql-security
 
-LABEL org.opencontainers.image.title="Sentinel GraphQL Security Agent" \
-      org.opencontainers.image.description="Sentinel GraphQL Security Agent for Sentinel reverse proxy" \
+LABEL org.opencontainers.image.title="Zentinel GraphQL Security Agent" \
+      org.opencontainers.image.description="Zentinel GraphQL Security Agent for Zentinel reverse proxy" \
       org.opencontainers.image.vendor="Raskell" \
-      org.opencontainers.image.source="https://github.com/raskell-io/sentinel-agent-graphql-security"
+      org.opencontainers.image.source="https://github.com/zentinelproxy/zentinel-agent-graphql-security"
 
-ENV RUST_LOG=info,sentinel_agent_graphql_security=debug \
-    SOCKET_PATH=/var/run/sentinel/graphql-security.sock
+ENV RUST_LOG=info,zentinel_agent_graphql_security=debug \
+    SOCKET_PATH=/var/run/zentinel/graphql-security.sock
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/sentinel-agent-graphql-security"]
+ENTRYPOINT ["/zentinel-agent-graphql-security"]

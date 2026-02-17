@@ -1,6 +1,6 @@
 //! Main GraphQL Security Agent implementation.
 //!
-//! Coordinates all analyzers and integrates with the Sentinel Agent Protocol v2.
+//! Coordinates all analyzers and integrates with the Zentinel Agent Protocol v2.
 
 use crate::analyzer::{
     AliasAnalyzer, AnalysisContext, AnalysisMetrics, AnalysisResult, Analyzer, BatchAnalyzer,
@@ -11,11 +11,11 @@ use crate::config::{FailAction, GraphQLSecurityConfig};
 use crate::error::{graphql_error_response, GraphQLError, Violation};
 use crate::parser::{parse_query, parse_request};
 use async_trait::async_trait;
-use sentinel_agent_protocol::v2::{
+use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, DrainReason, HealthConfig,
     HealthStatus, MetricsReport, ShutdownReason,
 };
-use sentinel_agent_protocol::{
+use zentinel_agent_protocol::{
     AgentResponse, Decision, EventType, HeaderOp, RequestHeadersEvent, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// GraphQL Security Agent for Sentinel.
+/// GraphQL Security Agent for Zentinel.
 ///
 /// Analyzes GraphQL queries for security concerns including depth, complexity,
 /// aliases, batch limits, introspection, field authorization, and persisted queries.
@@ -396,7 +396,7 @@ impl AgentHandlerV2 for GraphQLSecurityAgent {
     /// Handle request body chunk - analyze the GraphQL query when body is complete.
     async fn on_request_body_chunk(
         &self,
-        event: sentinel_agent_protocol::RequestBodyChunkEvent,
+        event: zentinel_agent_protocol::RequestBodyChunkEvent,
     ) -> AgentResponse {
         // Only process when we have the complete body
         if !event.is_last {
@@ -528,7 +528,7 @@ impl AgentHandlerV2 for GraphQLSecurityAgent {
 
     /// Return metrics report for the proxy.
     fn metrics_report(&self) -> Option<MetricsReport> {
-        use sentinel_agent_protocol::v2::{CounterMetric, GaugeMetric};
+        use zentinel_agent_protocol::v2::{CounterMetric, GaugeMetric};
 
         let requests = self.requests_total.load(Ordering::Relaxed);
         let blocked = self.requests_blocked.load(Ordering::Relaxed);
