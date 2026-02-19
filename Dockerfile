@@ -10,7 +10,7 @@
 ################################################################################
 FROM gcr.io/distroless/cc-debian12:nonroot AS prebuilt
 
-COPY zentinel-agent-graphql-security /zentinel-agent-graphql-security
+COPY zentinel-graphql-security-agent /zentinel-graphql-security-agent
 
 LABEL org.opencontainers.image.title="Zentinel GraphQL Security Agent" \
       org.opencontainers.image.description="Zentinel GraphQL Security Agent for Zentinel reverse proxy" \
@@ -22,4 +22,4 @@ ENV RUST_LOG=info,zentinel_agent_graphql_security=debug \
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/zentinel-agent-graphql-security"]
+ENTRYPOINT ["/zentinel-graphql-security-agent"]

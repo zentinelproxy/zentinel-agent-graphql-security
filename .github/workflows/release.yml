@@ -13,7 +13,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: zentinel-agent-graphql-security
+  BINARY_NAME: zentinel-graphql-security-agent
 
 jobs:
   build:
