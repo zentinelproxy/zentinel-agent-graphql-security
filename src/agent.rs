@@ -142,8 +142,10 @@ impl GraphQLSecurityAgent {
 
     /// Analyze a GraphQL request.
     ///
-    /// This method reads the config and analyzers first, then performs the analysis
-    /// synchronously to avoid holding non-Send types (ParsedDocument) across await points.
+    /// Reads config and analyzers, then parses and analyzes each query in the
+    /// request. The `ParsedDocument` (which contains a non-Send rowan `SyntaxNode`)
+    /// is scoped so it does not live across `.await` points, satisfying the Send
+    /// requirement of the outer future.
     async fn analyze_request(
         &self,
         body: &[u8],
@@ -151,7 +153,7 @@ impl GraphQLSecurityAgent {
         correlation_id: &str,
         client_ip: &str,
     ) -> Result<AnalysisResult, Violation> {
-        // Read config and analyzers before synchronous analysis
+        // Read config and analyzers before analysis
         let max_body_size = {
             let config = self.config.read().await;
             config.settings.max_body_size
@@ -163,21 +165,6 @@ impl GraphQLSecurityAgent {
             analyzers_guard.clone()
         };
 
-        // Now perform the synchronous analysis without holding any locks
-        Self::analyze_request_sync(body, headers, correlation_id, client_ip, max_body_size, &analyzers)
-    }
-
-    /// Synchronous analysis implementation.
-    ///
-    /// Separated to avoid holding non-Send ParsedDocument across await points.
-    fn analyze_request_sync(
-        body: &[u8],
-        headers: &HashMap<String, Vec<String>>,
-        correlation_id: &str,
-        client_ip: &str,
-        max_body_size: usize,
-        analyzers: &[Arc<dyn Analyzer>],
-    ) -> Result<AnalysisResult, Violation> {
         // Check body size
         if body.len() > max_body_size {
             return Err(Violation::invalid_request(&format!(
@@ -187,17 +174,14 @@ impl GraphQLSecurityAgent {
             )));
         }
 
-        // Parse the request(s)
+        // Parse the request(s) — this produces only Send types
         let requests = parse_request(body)?;
 
         let mut combined_result = AnalysisResult::ok();
 
         // Analyze each request in the batch
         for (idx, request) in requests.iter().enumerate() {
-            // Parse the query
-            let document = parse_query(&request.query)?;
-
-            // Build analysis context
+            // Build analysis context (Send + 'static-friendly)
             let ctx = AnalysisContext {
                 correlation_id: if requests.len() > 1 {
                     format!("{}-{}", correlation_id, idx)
@@ -214,13 +198,30 @@ impl GraphQLSecurityAgent {
                 query: request.query.clone(),
             };
 
-            // Run all analyzers synchronously using block_on
-            // This is necessary because the Analyzer trait is async but we want
-            // to avoid Send/Sync issues with the ParsedDocument
-            for analyzer in analyzers.iter() {
-                let result = futures::executor::block_on(analyzer.analyze(&document, &ctx));
-                combined_result.merge(result);
-            }
+            // Parse the query and run all analyzers within a block_in_place
+            // scope. ParsedDocument contains a non-Send rowan SyntaxNode, and
+            // the Analyzer trait uses #[async_trait(?Send)], producing !Send
+            // futures. block_in_place moves the current task off the tokio
+            // worker thread so we can safely call Handle::block_on without
+            // deadlocking, while still having access to the tokio runtime
+            // (which analyzers like PersistedQueryAnalyzer need for
+            // tokio::sync::RwLock).
+            let request_result = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+
+                let document = parse_query(&request.query)?;
+
+                let mut result = AnalysisResult::ok();
+                for analyzer in analyzers.iter() {
+                    let analyzer_result =
+                        handle.block_on(analyzer.analyze(&document, &ctx));
+                    result.merge(analyzer_result);
+                }
+
+                Ok::<AnalysisResult, Violation>(result)
+            })?;
+
+            combined_result.merge(request_result);
         }
 
         Ok(combined_result)
@@ -654,7 +655,7 @@ mod tests {
         assert!(agent.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_analyze_valid_query() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
         let body = br#"{"query": "{ users { id name } }"}"#;
@@ -668,7 +669,7 @@ mod tests {
         assert!(!result.unwrap().has_violations());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_analyze_depth_exceeded() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
         let body = br#"{"query": "{ a { b { c { d { e { f { g } } } } } } }"}"#;
@@ -682,7 +683,7 @@ mod tests {
         assert!(result.unwrap().has_violations());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_analyze_invalid_json() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
         let body = b"not json";
@@ -695,7 +696,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_body_size_limit() {
         let mut config = test_config();
         config.settings.max_body_size = 10;

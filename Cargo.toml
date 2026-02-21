@@ -28,9 +28,6 @@ serde_yaml = "0.9"
 thiserror = "2"
 anyhow = "1"
 
-# Futures for block_on
-futures = "0.3"
-
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
