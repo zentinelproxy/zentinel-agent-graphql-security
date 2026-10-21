@@ -1,565 +1,207 @@
-# Zentinel GraphQL Security Agent
+<p align="center">
+  <a href="https://zentinelproxy.io">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/zentinelproxy/design/main/marks/lockup/zentinel-lockup-dark.svg">
+      <img alt="Zentinel" src="https://raw.githubusercontent.com/zentinelproxy/design/main/marks/lockup/zentinel-lockup-light.svg" height="52">
+    </picture>
+  </a>
+</p>
 
-A dedicated GraphQL security agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Built in **pure Rust** using the [apollo-parser](https://crates.io/crates/apollo-parser) CST, it inspects every GraphQL request in real time and enforces configurable limits on query depth, complexity, aliases, batch size, introspection, field-level authorization, and persisted query allowlists.
+<h3 align="center">GraphQL security agent</h3>
 
-## Features
+<p align="center">Parses GraphQL request bodies and enforces limits on depth, cost, aliases, batch size and introspection, at the request-body stage.</p>
 
-### Query Depth Limiting
-- Calculates the maximum nesting depth of each operation
-- Configurable `max_depth` threshold (default: 10)
-- Follows fragment spreads and inline fragments with cycle detection
-- Option to ignore introspection fields (`__schema`, `__type`) in depth calculation
+<p align="center">
+  <a href="https://github.com/zentinelproxy/zentinel-agent-graphql-security/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zentinelproxy/zentinel-agent-graphql-security/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-9b4d8a?style=flat&labelColor=1f161e">
+  <img alt="Agent protocol v2" src="https://img.shields.io/badge/agent%20protocol-v2-f68d31?style=flat&labelColor=1f161e">
+</p>
 
-### Complexity / Cost Analysis
-- Estimates query cost using field costs and list-size multipliers
-- Configurable per-type and per-field cost overrides (e.g., `Query.users: 10`)
-- Automatically detects pagination arguments (`first`, `last`, `limit`, `pageSize`) to derive list multipliers
-- Default multiplier applied when no pagination argument is present
-- Configurable `max_complexity` threshold (default: 1000)
+<p align="center">
+  <a href="https://registry.zentinelproxy.io/graphql-security/">Registry</a> &middot;
+  <a href="https://docs.zentinelproxy.io">Docs</a> &middot;
+  <a href="https://github.com/zentinelproxy">All repositories</a>
+</p>
 
-### Alias Limiting
-- Counts total aliases across the entire query
-- Tracks per-field duplicate alias counts
-- Configurable `max_aliases` (default: 10) and `max_duplicate_aliases` (default: 3)
-- Prevents alias-based resource exhaustion attacks (e.g., aliasing the same expensive field hundreds of times)
+For teams running a GraphQL API behind Zentinel who want abusive queries stopped before they reach the resolver. The agent parses each query with [apollo-parser](https://crates.io/crates/apollo-parser) (no schema needed), runs the enabled analyzers, and on any violation answers HTTP 200 with a GraphQL `errors` body instead of forwarding the request. `settings.fail_action: allow` turns it into log-only mode. If the agent is unreachable, the `failure-mode` of the Zentinel filter decides.
 
-### Batch Query Limiting
-- Detects JSON array batch requests and counts operations
-- Configurable `max_queries` per batch (default: 5)
-- Single (non-batch) requests are never limited by this analyzer
-
-### Introspection Control
-- Blocks `__schema` and `__type` queries in production
-- Allows `__typename` by default (required by Apollo Client for union/interface resolution)
-- IP-based and header-based allowlists for developer access
-- Global toggle to enable or disable introspection entirely
-
-### Field-Level Authorization
-- Role-based and scope-based access control on individual fields
-- Glob pattern matching for field selectors (e.g., `Query.admin*`, `Mutation.delete*`, `User.*`)
-- Reads roles/scopes from configurable request headers (defaults: `X-User-Roles`, `X-User-Scopes`)
-- Supports both `require_roles` (any-of) and `require_scopes` (any-of) semantics
-
-### Persisted Queries / Allowlist
-- **Allowlist mode** -- only queries whose SHA-256 hash appears in a pre-loaded JSON file are permitted
-- **Cache mode** -- any query is allowed; hashes are tracked for observability
-- Compatible with Apollo Automatic Persisted Queries (APQ) via the `persistedQuery` extension
-- Optional `require_hash` flag to reject requests that do not include an APQ hash
-
-### Protocol v2 Support
-- Full gRPC transport with capability negotiation, health reporting, and metrics export
-- Backwards-compatible UDS (Unix Domain Socket) mode via a v1 adapter
-- Live configuration push -- update settings without restarting the agent
-- Prometheus-style counter and gauge metrics (`graphql_security_requests_total`, `graphql_security_requests_blocked_total`, `graphql_security_block_rate_percent`)
-
-## Installation
-
-### Using Bundle (Recommended)
+## Quick start
 
 ```bash
-# Install just this agent
 zentinel bundle install graphql-security
-
-# Or install all bundled agents
-zentinel bundle install
+zentinel-graphql-security-agent -s /tmp/zentinel-graphql-security.sock
 ```
 
-The bundle command downloads the correct binary for your platform and places it in the standard location. See the [bundle documentation](https://docs.zentinelproxy.io/deployment/bundle/) for details.
+Without a config file the agent runs with the defaults below (introspection blocked, depth 10, cost 1000).
 
-### Using Cargo
+```kdl
+system {
+    worker-threads 0
+}
 
-`zentinel-agent-graphql-security` is not published on crates.io, so `cargo install
-zentinel-agent-graphql-security` does not work. Install straight from the
-repository instead:
+listeners {
+    listener "http" {
+        address "0.0.0.0:8080"
+        protocol "http"
+    }
+}
+
+upstreams {
+    upstream "graphql-backend" {
+        target "127.0.0.1:4000"
+    }
+}
+
+// Request bodies reach agents only with body inspection switched on.
+waf {
+    mode "off"
+    body-inspection {
+        inspect-request-body #true
+        max-inspection-bytes 1048576
+        content-types "application/json"
+    }
+}
+
+agents {
+    agent "graphql-security" type="custom" {
+        unix-socket "/tmp/zentinel-graphql-security.sock"
+        events "request_headers" "request_body"
+        request-body-mode "buffer"
+        timeout-ms 200
+    }
+}
+
+filters {
+    filter "graphql-security" {
+        type "agent"
+        agent "graphql-security"
+        failure-mode "closed"
+    }
+}
+
+routes {
+    route "graphql" {
+        matches { path-prefix "/graphql" }
+        upstream "graphql-backend"
+        filters "graphql-security"
+    }
+}
+```
 
 ```bash
-cargo install --git https://github.com/zentinelproxy/zentinel-agent-graphql-security
+curl -s -H 'content-type: application/json' \
+  -d '{"query":"{ __schema { types { name } } }"}' http://localhost:8080/graphql
+# {"errors":[{"message":"...","extensions":{"code":"INTROSPECTION_BLOCKED","zentinel":true}}]}
 ```
 
-This builds and installs the `zentinel-graphql-security-agent` binary.
+## Install
 
-### Prebuilt Binaries
-
-Each [release](https://github.com/zentinelproxy/zentinel-agent-graphql-security/releases) ships binaries
-for `linux-x86_64`, `linux-aarch64`, and `darwin-aarch64`:
+### Bundle (recommended)
 
 ```bash
-VERSION=0.4.0
-PLATFORM=linux-x86_64   # or linux-aarch64, darwin-aarch64
-curl -fsSL -o zentinel-graphql-security-agent.tar.gz \
-  "https://github.com/zentinelproxy/zentinel-agent-graphql-security/releases/download/v${VERSION}/zentinel-graphql-security-agent-${VERSION}-${PLATFORM}.tar.gz"
-tar -xzf zentinel-graphql-security-agent.tar.gz
-sudo install -m 0755 zentinel-graphql-security-agent /usr/local/bin/
+zentinel bundle install graphql-security
 ```
 
-### From Source
+Downloads the release binary pinned in Zentinel's bundle lock and installs it as `zentinel-graphql-security-agent`.
+
+### Release binaries
+
+Tarballs for `linux-x86_64`, `linux-aarch64` and `darwin-aarch64` are attached to each [release](https://github.com/zentinelproxy/zentinel-agent-graphql-security/releases).
+
+### From source
 
 ```bash
-git clone https://github.com/zentinelproxy/zentinel-agent-graphql-security
-cd zentinel-agent-graphql-security
-cargo build --release
+cargo install --git https://github.com/zentinelproxy/zentinel-agent-graphql-security   # needs protoc
 ```
 
-## Quick Start
-
-```bash
-# gRPC transport (recommended -- full v2 protocol)
-zentinel-graphql-security-agent \
-  --config config.yaml \
-  --grpc-address 0.0.0.0:50051
-
-# UDS transport (v1 compatibility)
-zentinel-graphql-security-agent \
-  --config config.yaml \
-  --socket /var/run/zentinel/graphql-security.sock
-
-# With debug logging
-RUST_LOG=debug zentinel-graphql-security-agent --config config.yaml --grpc-address 0.0.0.0:50051
-```
-
-### Command Line Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--config`, `-c` | `config.yaml` | Path to YAML configuration file |
-| `--socket`, `-s` | `/tmp/zentinel-graphql-security.sock` | Unix socket path (v1 mode) |
-| `--grpc-address` | *(none)* | gRPC listen address, e.g. `0.0.0.0:50051` (v2 mode) |
-| `--log-level`, `-l` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
+Installs `zentinel-graphql-security-agent`.
 
 ## Configuration
 
-The agent is configured with a YAML file. Every section is optional; sensible defaults are applied when a key is omitted.
-
-```yaml
-version: "1"
-
-settings:
-  # Maximum request body size in bytes (default: 1048576 = 1 MB)
-  max_body_size: 1048576
-  # Add X-GraphQL-Depth, X-GraphQL-Complexity, etc. headers to responses
-  debug_headers: false
-  # Action when a violation is detected: "block" or "allow" (log-only)
-  fail_action: block
-
-depth:
-  enabled: true
-  # Maximum nesting depth (default: 10)
-  max_depth: 10
-  # Exclude __schema / __type from depth calculation
-  ignore_introspection: true
-
-complexity:
-  enabled: true
-  # Maximum allowed complexity score (default: 1000)
-  max_complexity: 1000
-  # Base cost per field (default: 1)
-  default_field_cost: 1
-  # Multiplier when no pagination argument is found (default: 10)
-  default_list_multiplier: 10
-  # Override cost for specific fields
-  field_costs:
-    Query.users: 10
-    Query.orders: 15
-    Mutation.createOrder: 20
-  # Override cost for all fields of a type
-  type_costs:
-    AuditLog: 5
-  # Arguments whose value is used as the list multiplier
-  list_size_arguments:
-    - first
-    - last
-    - limit
-    - pageSize
-
-aliases:
-  enabled: true
-  # Maximum total aliases in one query (default: 10)
-  max_aliases: 10
-  # Maximum times the same field may be aliased (default: 3)
-  max_duplicate_aliases: 3
-
-batch:
-  enabled: true
-  # Maximum operations in a JSON-array batch request (default: 5)
-  max_queries: 5
-
-introspection:
-  enabled: true
-  # Globally allow introspection (default: false)
-  allow: false
-  # Allow __typename (needed by Apollo Client; default: true)
-  allow_typename: true
-  # IPs or header values that are always allowed to introspect
-  allowed_clients:
-    - "10.0.0.0/8"
-    - "dev-introspection-key"
-  # Header to check for allowed clients
-  allowed_clients_header: "X-Introspection-Key"
-
-field_auth:
-  enabled: true
-  rules:
-    - fields:
-        - "Query.admin*"
-        - "Mutation.delete*"
-      require_roles:
-        - admin
-      # Header containing comma-separated roles (default: X-User-Roles)
-      roles_header: "X-User-Roles"
-    - fields:
-        - "User.email"
-        - "User.phone"
-      require_scopes:
-        - "read:pii"
-      scopes_header: "X-User-Scopes"
-
-persisted_queries:
-  enabled: false
-  # "allowlist" (only pre-approved hashes) or "cache" (any query, tracked)
-  mode: allowlist
-  # Path to a JSON file containing allowed query hashes
-  allowlist_file: "/etc/zentinel/graphql-allowlist.json"
-  # Require the APQ hash extension on every request
-  require_hash: false
-```
-
-### Allowlist File Format
-
-When using `persisted_queries.mode: allowlist`, provide a JSON file:
-
-```json
-{
-  "version": 1,
-  "queries": [
-    {
-      "hash": "a1b2c3d4e5f6...",
-      "name": "GetCurrentUser"
-    },
-    {
-      "hash": "f6e5d4c3b2a1...",
-      "name": "ListProducts"
-    }
-  ]
-}
-```
-
-Hashes are compared case-insensitively. You can generate a hash for any query with:
-
-```bash
-echo -n '{ users { id name } }' | shasum -a 256
-```
-
-## Zentinel Proxy Integration
-
-Register the agent in your Zentinel proxy configuration:
-
-### gRPC Transport (v2)
-
-```kdl
-agents {
-    agent "graphql-security" {
-        type "custom"
-        grpc "127.0.0.1:50051"
-        events "request_headers" "request_body"
-        timeout-ms 100
-        failure-mode "open"
-    }
-}
-
-routes {
-    route "graphql" {
-        matches { path-prefix "/graphql" }
-        upstream "graphql-backend"
-        agents "graphql-security"
-    }
-}
-```
-
-### Unix Socket (v1 compatibility)
-
-```kdl
-agents {
-    agent "graphql-security" {
-        type "custom"
-        unix-socket "/var/run/zentinel/graphql-security.sock"
-        events "request_headers" "request_body"
-        timeout-ms 100
-        failure-mode "open"
-    }
-}
-
-routes {
-    route "graphql" {
-        matches { path-prefix "/graphql" }
-        upstream "graphql-backend"
-        agents "graphql-security"
-    }
-}
-```
-
-The agent subscribes to `request_headers` and `request_body_chunk` events. It signals `needs_more` on the headers event and performs the full analysis once the complete request body arrives.
-
-## Response Format
-
-When a violation is detected and `fail_action` is `block`, the agent returns an **HTTP 200** response with a standard GraphQL error body:
-
-```json
-{
-  "errors": [
-    {
-      "message": "Query depth of 15 exceeds maximum allowed depth of 10",
-      "extensions": {
-        "code": "DEPTH_EXCEEDED",
-        "zentinel": true,
-        "actual": 15,
-        "max": 10
-      }
-    }
-  ]
-}
-```
-
-### Violation Codes
-
-| Code | Description |
-|------|-------------|
-| `DEPTH_EXCEEDED` | Query nesting depth exceeds `max_depth` |
-| `COMPLEXITY_EXCEEDED` | Calculated cost exceeds `max_complexity` |
-| `TOO_MANY_ALIASES` | Alias count or duplicate alias count exceeds limit |
-| `TOO_MANY_BATCH_QUERIES` | Batch request contains more operations than `max_queries` |
-| `INTROSPECTION_BLOCKED` | Introspection query sent by a non-allowed client |
-| `FIELD_UNAUTHORIZED` | Client lacks the required role or scope for a field |
-| `QUERY_NOT_ALLOWED` | Query hash not found in the persisted query allowlist |
-| `PARSE_ERROR` | GraphQL query could not be parsed |
-| `INVALID_REQUEST` | Request body is not valid JSON or is too large |
-
-### Debug Headers
-
-When `settings.debug_headers` is enabled, every response includes analysis metrics:
-
-```
-X-GraphQL-Depth: 4
-X-GraphQL-Complexity: 87
-X-GraphQL-Aliases: 2
-X-GraphQL-Operations: 1
-X-GraphQL-Fields: 12
-```
-
-## Example Scenarios
-
-### Blocking a Deeply Nested Query
-
-A query like the following (depth 7) would be rejected with the default `max_depth: 10` raised to a stricter limit of 5:
-
-```graphql
-# depth.max_depth: 5
-{
-  users {
-    posts {
-      comments {
-        author {
-          followers {
-            posts {    # depth = 7 -- blocked
-              title
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Response:
-
-```json
-{
-  "errors": [{
-    "message": "Query depth of 7 exceeds maximum allowed depth of 5",
-    "extensions": { "code": "DEPTH_EXCEEDED", "zentinel": true, "actual": 7, "max": 5 }
-  }]
-}
-```
-
-### Preventing Alias-Based DoS
-
-An attacker duplicates an expensive field with aliases to multiply server-side work:
-
-```graphql
-{
-  a1: expensiveReport(year: 2024) { data }
-  a2: expensiveReport(year: 2024) { data }
-  a3: expensiveReport(year: 2024) { data }
-  a4: expensiveReport(year: 2024) { data }
-  # ... repeated many more times
-}
-```
-
-With `aliases.max_aliases: 10` and `aliases.max_duplicate_aliases: 3`, the request is blocked as soon as the fourth alias of the same field is detected.
-
-### Blocking Introspection in Production
-
-With the default configuration (`introspection.allow: false`), any `__schema` or `__type` query from an unknown client is rejected:
-
-```graphql
-{
-  __schema {
-    types { name }
-  }
-}
-```
-
-Developers can still introspect by setting a header:
-
-```bash
-curl -H "X-Introspection-Key: dev-introspection-key" \
-     -d '{"query": "{ __schema { types { name } } }"}' \
-     https://api.example.com/graphql
-```
-
-### Enforcing Field-Level Authorization
-
-Restrict admin-only mutations:
-
-```yaml
-field_auth:
-  enabled: true
-  rules:
-    - fields: ["Mutation.delete*"]
-      require_roles: ["admin"]
-```
-
-A request from a user without the `admin` role:
-
-```graphql
-mutation {
-  deleteUser(id: "42") { success }
-}
-```
-
-Response:
-
-```json
-{
-  "errors": [{
-    "message": "Access to field 'Mutation.deleteUser' is not authorized",
-    "extensions": { "code": "FIELD_UNAUTHORIZED", "zentinel": true, "field": "Mutation.deleteUser" }
-  }]
-}
-```
-
-### Limiting Batch Queries
-
-A batch of 10 operations with `batch.max_queries: 5`:
-
-```json
-[
-  {"query": "{ user(id: 1) { name } }"},
-  {"query": "{ user(id: 2) { name } }"},
-  {"query": "{ user(id: 3) { name } }"},
-  {"query": "{ user(id: 4) { name } }"},
-  {"query": "{ user(id: 5) { name } }"},
-  {"query": "{ user(id: 6) { name } }"},
-  {"query": "{ user(id: 7) { name } }"},
-  {"query": "{ user(id: 8) { name } }"},
-  {"query": "{ user(id: 9) { name } }"},
-  {"query": "{ user(id: 10) { name } }"}
-]
-```
-
-Response:
-
-```json
-{
-  "errors": [{
-    "message": "Batch contains 10 queries, maximum allowed is 5",
-    "extensions": { "code": "TOO_MANY_BATCH_QUERIES", "zentinel": true, "actual": 10, "max": 5 }
-  }]
-}
-```
-
-## Metrics
-
-The agent exports Prometheus-compatible metrics via the v2 protocol:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `graphql_security_requests_total` | Counter | Total requests processed |
-| `graphql_security_requests_blocked_total` | Counter | Total requests blocked |
-| `graphql_security_block_rate_percent` | Gauge | Percentage of requests blocked |
-
-## Architecture
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                       Zentinel Proxy                              │
-└──────────────────────────┬────────────────────────────────────────┘
-                           │ gRPC / Unix Socket
-                           ▼
-┌───────────────────────────────────────────────────────────────────┐
-│               GraphQL Security Agent                              │
-│                                                                   │
-│   ┌──────────┐  ┌─────────────┐  ┌──────────┐  ┌─────────────┐  │
-│   │  Depth   │  │ Complexity  │  │  Alias   │  │   Batch     │  │
-│   │ Analyzer │  │  Analyzer   │  │ Analyzer │  │  Analyzer   │  │
-│   └────┬─────┘  └──────┬──────┘  └────┬─────┘  └──────┬──────┘  │
-│        │               │              │               │          │
-│   ┌────┴─────┐  ┌──────┴──────┐  ┌────┴─────────────┐│          │
-│   │Introspec.│  │ Field Auth  │  │Persisted Queries ││          │
-│   │ Analyzer │  │  Analyzer   │  │    Analyzer      ││          │
-│   └────┬─────┘  └──────┬──────┘  └────┬─────────────┘│          │
-│        │               │              │               │          │
-│        └───────────────┼──────────────┼───────────────┘          │
-│                        ▼              ▼                           │
-│              ┌─────────────────────────────────┐                 │
-│              │       Analysis Result           │                 │
-│              │  violations[] + metrics{}       │                 │
-│              └────────────┬────────────────────┘                 │
-│                           ▼                                      │
-│              ┌─────────────────────────────────┐                 │
-│              │   Decision: Allow / Block       │                 │
-│              │   (GraphQL-compliant response)  │                 │
-│              └─────────────────────────────────┘                 │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-## Testing
-
-```bash
-# Unit tests
-cargo test --lib
-
-# All tests
-cargo test
-
-# With logging output
-RUST_LOG=debug cargo test -- --nocapture
-```
+The agent reads a YAML file (`-c`, default `config.yaml`); if the file does not exist it starts with the defaults. It also accepts configuration over the protocol (`on_configure`), but Zentinel 0.6.50 does not forward an `agent { config { ... } }` block, so set it here.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-c`, `--config` | `config.yaml` | Path to the YAML configuration file. |
+| `-s`, `--socket` | `/tmp/zentinel-graphql-security.sock` | Unix socket to listen on. |
+| `--grpc-address` | none | Listen for gRPC on this address instead of the socket, e.g. `0.0.0.0:50051`. |
+| `-l`, `--log-level` | `info` | `trace`, `debug`, `info`, `warn` or `error`. `RUST_LOG` is not read. |
+
+Configuration file keys. Every section is optional; unknown keys are ignored, so check spelling.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `settings.max_body_size` | `1048576` | Larger bodies are rejected with `INVALID_REQUEST`. |
+| `settings.debug_headers` | `false` | Add `X-GraphQL-Depth`, `-Complexity`, `-Aliases`, `-Operations` and `-Fields` to the response. Zentinel 0.6.50 drops headers sent from the body phase, so these do not arrive. |
+| `settings.fail_action` | `block` | `block` answers with the errors body; `allow` only logs violations. |
+| `depth.enabled` | `true` | Enable depth limiting. |
+| `depth.max_depth` | `10` | Maximum selection nesting, following fragments (cycles are cut). |
+| `depth.ignore_introspection` | `true` | Do not count `__schema` / `__type` subtrees. |
+| `complexity.enabled` | `true` | Enable cost analysis. |
+| `complexity.max_complexity` | `1000` | Maximum estimated cost. |
+| `complexity.default_field_cost` | `1` | Cost of a field without an override. |
+| `complexity.default_list_multiplier` | `10` | Multiplier for a field's children when it has no list-size argument. |
+| `complexity.list_size_arguments` | `first`, `last`, `limit`, `pageSize` | Arguments whose integer value is used as the multiplier. |
+| `complexity.field_costs` | empty | Per-field cost, e.g. `Query.users: 10`. |
+| `complexity.type_costs` | empty | Per-type cost, applied where the parent type is known (root fields, fragments, inline fragments). |
+| `aliases.enabled` | `true` | Enable alias limiting. |
+| `aliases.max_aliases` | `10` | Maximum aliases in one query. |
+| `aliases.max_duplicate_aliases` | `3` | Maximum aliases of the same field. |
+| `batch.enabled` | `true` | Enable batch limiting. |
+| `batch.max_queries` | `5` | Maximum operations in a JSON-array batch. |
+| `introspection.enabled` | `true` | Enable introspection control. |
+| `introspection.allow` | `false` | Allow introspection for everyone. |
+| `introspection.allow_typename` | `true` | Allow `__typename`. |
+| `introspection.allowed_clients` | empty | Exact client IPs or header values allowed to introspect (no CIDR). Does not work yet, see below. |
+| `introspection.allowed_clients_header` | none | Header whose value is compared with `allowed_clients`. |
+| `field_auth.enabled` | `false` | Enable field rules. Not usable yet, see below. |
+| `field_auth.rules[]` | empty | `fields` (glob patterns), `require_roles` / `require_scopes` (any of), `roles_header` / `scopes_header` (defaults `x-user-roles`, `x-user-scopes`). |
+| `persisted_queries.enabled` | `false` | Enable the allowlist. |
+| `persisted_queries.mode` | `allowlist` | `allowlist` permits only listed hashes; `cache` permits everything and does nothing else. |
+| `persisted_queries.allowlist_file` | none | JSON file `{"queries":[{"hash":"<sha256 hex>","name":"..."}]}`, loaded at start. A missing file means an empty list. |
+| `persisted_queries.require_hash` | `false` | Reject requests without `extensions.persistedQuery.sha256Hash`. |
+
+The hash of a query is the SHA-256 of its text with surrounding whitespace trimmed (`printf '%s' '{ users { id } }' | shasum -a 256`), compared case-insensitively.
+
+Full reference: <https://registry.zentinelproxy.io/graphql-security/>
+
+## How it works
+
+- **Body only.** The headers event is always answered with "allow, send the body"; analysis runs on the final body chunk. `GET` requests with the query in the URL are not inspected, and the proxy only sends bodies when `waf { body-inspection { inspect-request-body #true } }` is set and the content type matches. Use `request-body-mode "buffer"` and a `max-inspection-bytes` at least as large as `settings.max_body_size`: the agent analyzes only the last chunk it receives, and a body cut off at the inspection limit is allowed without analysis.
+- **Analyzers:** depth, complexity, aliases, batch (JSON array of operations), introspection, field rules and persisted queries. Every operation in a batch is analyzed, and all violations are reported together.
+- **Block response:** status 200 and `{"errors":[{"message", "extensions":{"code","zentinel":true, "actual", "max", "field"}}]}`. Codes: `DEPTH_EXCEEDED`, `COMPLEXITY_EXCEEDED`, `TOO_MANY_ALIASES`, `TOO_MANY_BATCH_QUERIES`, `INTROSPECTION_BLOCKED`, `FIELD_UNAUTHORIZED`, `QUERY_NOT_ALLOWED`, `PARSE_ERROR`, `INVALID_REQUEST` (not JSON, no `query`, or too large). The agent asks for `Content-Type: application/json` as a response-header operation, which Zentinel 0.6.50 does not apply to a block decided on the body.
+- **Complexity** is an estimate without a schema: each field costs its configured cost, and the fields under it are multiplied by its list-size argument or `default_list_multiplier`. Multipliers apply one level down and do not compound.
+- **Metrics** over the agent protocol: `graphql_security_requests_total`, `graphql_security_requests_blocked_total`, `graphql_security_block_rate_percent`.
+
+Known limitations in the current code:
+
+- **Field rules and introspection allowlists cannot see the request.** The body is analyzed with no headers and the client IP `unknown`, so `allowed_clients` never matches, and with `field_auth` enabled every field a rule matches is denied regardless of the caller's roles. Nested selector patterns such as `User.email` only match through fragments, because nested field types are unknown without a schema.
+- **Persisted queries trust the client's hash.** In `allowlist` mode an `extensions.persistedQuery.sha256Hash` value is checked instead of the query's own hash, so a client can send any query with a listed hash. Hash-only (APQ) requests without a `query` are rejected as `INVALID_REQUEST`.
 
 ## Development
 
 ```bash
-# Debug build with logging
-RUST_LOG=debug cargo run -- --config config.yaml --grpc-address 0.0.0.0:50051
-
-# Release build
-cargo build --release
-
-# Check formatting
-cargo fmt --check
-
-# Lint
-cargo clippy
+cargo build
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
+
+Needs stable Rust (CI uses `dtolnay/rust-toolchain@stable`) and `protoc` (CI installs `protobuf-compiler`).
+
+## Related
+
+- [Registry page](https://registry.zentinelproxy.io/graphql-security/)
+- [Agent configuration](https://docs.zentinelproxy.io/configuration/agents/)
+- [Agent protocol v2](https://docs.zentinelproxy.io/agents/v2/)
+- [Zentinel](https://github.com/zentinelproxy/zentinel)
 
 ## License
 
-Apache-2.0
+Apache-2.0 (declared in Cargo.toml; this repository has no LICENSE file yet).
 
-## Contributing
+---
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Security
-
-Report security vulnerabilities to security@raskell.io.
+<p align="center">
+  <sub>Part of <a href="https://zentinelproxy.io">Zentinel</a>, the security-first reverse proxy. The shisa guards the gate.</sub>
+</p>
