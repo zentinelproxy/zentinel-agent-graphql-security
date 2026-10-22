@@ -7,20 +7,23 @@ use crate::analyzer::{
     ComplexityAnalyzer, DepthAnalyzer, FieldAuthAnalyzer, IntrospectionAnalyzer,
     PersistedQueryAnalyzer,
 };
-use crate::config::{FailAction, GraphQLSecurityConfig};
+use crate::config::{canonical_config_hash, FailAction, GraphQLSecurityConfig};
 use crate::error::{graphql_error_response, GraphQLError, Violation};
 use crate::parser::{parse_query, parse_request};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, DrainReason, HealthConfig,
     HealthStatus, MetricsReport, ShutdownReason, PROTOCOL_VERSION_2,
 };
 use zentinel_agent_protocol::{AgentResponse, Decision, EventType, HeaderOp, RequestHeadersEvent};
+
+/// `Analyzer::name` of the persisted-query analyzer.
+const PERSISTED_ANALYZER: &str = "persisted_queries";
 
 /// GraphQL Security Agent for Zentinel.
 ///
@@ -38,65 +41,108 @@ pub struct GraphQLSecurityAgent {
     requests_blocked: AtomicU64,
     /// Configuration version
     config_version: RwLock<Option<String>>,
+    /// The configuration the agent was started with (YAML file or defaults);
+    /// a `config { }` block from the proxy is laid over this.
+    base_config: GraphQLSecurityConfig,
+    /// Hash of the last Configure payload that was applied. Held for the whole
+    /// of `on_configure`, which also serialises concurrent configures.
+    applied_config_hash: Mutex<Option<u64>>,
 }
 
 impl GraphQLSecurityAgent {
     /// Create a new GraphQL security agent with the given configuration.
     pub fn new(config: GraphQLSecurityConfig) -> Result<Self, GraphQLError> {
         let analyzers = Self::build_analyzers(&config);
-        Ok(Self {
-            config: RwLock::new(config),
-            analyzers: RwLock::new(analyzers),
-            requests_total: AtomicU64::new(0),
-            requests_blocked: AtomicU64::new(0),
-            config_version: RwLock::new(None),
-        })
+        Ok(Self::from_parts(config, analyzers))
     }
 
     /// Create agent with async initialization (for loading allowlist files).
     pub async fn with_async_init(config: GraphQLSecurityConfig) -> Result<Self, GraphQLError> {
-        let mut analyzers: Vec<Arc<dyn Analyzer>> = Vec::new();
+        let analyzers = Self::build_analyzers_async(&config, None).await?;
+        Ok(Self::from_parts(config, analyzers))
+    }
 
-        // Add enabled analyzers
-        if config.depth.enabled {
-            analyzers.push(Arc::new(DepthAnalyzer::new(config.depth.clone())));
-        }
-
-        if config.complexity.enabled {
-            analyzers.push(Arc::new(ComplexityAnalyzer::new(config.complexity.clone())));
-        }
-
-        if config.aliases.enabled {
-            analyzers.push(Arc::new(AliasAnalyzer::new(config.aliases.clone())));
-        }
-
-        if config.batch.enabled {
-            analyzers.push(Arc::new(BatchAnalyzer::new(config.batch.clone())));
-        }
-
-        if config.introspection.enabled {
-            analyzers.push(Arc::new(IntrospectionAnalyzer::new(
-                config.introspection.clone(),
-            )));
-        }
-
-        if config.field_auth.enabled {
-            analyzers.push(Arc::new(FieldAuthAnalyzer::new(config.field_auth.clone())));
-        }
-
-        if config.persisted_queries.enabled {
-            let persisted_analyzer =
-                PersistedQueryAnalyzer::with_allowlist(config.persisted_queries.clone()).await?;
-            analyzers.push(Arc::new(persisted_analyzer));
-        }
-
-        Ok(Self {
+    fn from_parts(config: GraphQLSecurityConfig, analyzers: Vec<Arc<dyn Analyzer>>) -> Self {
+        Self {
+            base_config: config.clone(),
+            applied_config_hash: Mutex::new(None),
             config: RwLock::new(config),
             analyzers: RwLock::new(analyzers),
             requests_total: AtomicU64::new(0),
             requests_blocked: AtomicU64::new(0),
             config_version: RwLock::new(None),
-        })
+        }
+    }
+
+    /// Build analyzers, loading the persisted-query allowlist from its file.
+    ///
+    /// `persisted` is an existing persisted-query analyzer to keep instead of
+    /// building a new one (its allowlist is state that must survive a
+    /// configure that did not change `persisted_queries`).
+    async fn build_analyzers_async(
+        config: &GraphQLSecurityConfig,
+        persisted: Option<Arc<dyn Analyzer>>,
+    ) -> Result<Vec<Arc<dyn Analyzer>>, GraphQLError> {
+        let mut analyzers: Vec<Arc<dyn Analyzer>> = Self::build_analyzers(config)
+            .into_iter()
+            .filter(|a| a.name() != PERSISTED_ANALYZER)
+            .collect();
+        if config.persisted_queries.enabled {
+            let analyzer = match persisted {
+                Some(existing) => existing,
+                None => Arc::new(
+                    PersistedQueryAnalyzer::with_allowlist(config.persisted_queries.clone())
+                        .await?,
+                ),
+            };
+            analyzers.push(analyzer);
+        }
+        Ok(analyzers)
+    }
+
+    /// Apply a Configure payload: lay it over the startup configuration.
+    ///
+    /// Returns the payload's hash and the settings whose effective value
+    /// changed, or an error (unknown key, wrong type, blank list entry,
+    /// unreadable allowlist), in which case nothing is applied. A payload
+    /// identical to the last one applied, or one that changes nothing, keeps
+    /// the running analyzers and their state.
+    pub async fn apply_configure(
+        &self,
+        block: &serde_json::Value,
+        version: Option<String>,
+    ) -> Result<(u64, Vec<String>), String> {
+        let hash = canonical_config_hash(block);
+        let mut applied = self.applied_config_hash.lock().await;
+        if *applied == Some(hash) {
+            return Ok((hash, Vec::new()));
+        }
+
+        let new_config = self.base_config.overlay(block)?;
+        let changed = self.config.read().await.changed_keys(&new_config);
+        if !changed.is_empty() {
+            let keep_persisted = {
+                let current = self.config.read().await;
+                if current.persisted_queries == new_config.persisted_queries {
+                    self.analyzers
+                        .read()
+                        .await
+                        .iter()
+                        .find(|a| a.name() == PERSISTED_ANALYZER)
+                        .cloned()
+                } else {
+                    None
+                }
+            };
+            let analyzers = Self::build_analyzers_async(&new_config, keep_persisted)
+                .await
+                .map_err(|e| e.to_string())?;
+            *self.config.write().await = new_config;
+            *self.analyzers.write().await = analyzers;
+            *self.config_version.write().await = version;
+        }
+        *applied = Some(hash);
+        Ok((hash, changed))
     }
 
     /// Build analyzers from configuration (sync version).
@@ -501,25 +547,23 @@ impl AgentHandlerV2 for GraphQLSecurityAgent {
     }
 
     /// Handle configuration updates from the proxy.
+    ///
+    /// The proxy sends the `config { }` block on every connection: once per
+    /// pooled connection and again on every reconnect, so this must be
+    /// idempotent (see `apply_configure`). The payload itself is never
+    /// logged, only its hash and the names of the settings that changed.
     async fn on_configure(&self, config: serde_json::Value, version: Option<String>) -> bool {
-        info!("Received configuration update, version: {:?}", version);
-
-        // Try to parse the new configuration
-        match serde_json::from_value::<GraphQLSecurityConfig>(config) {
-            Ok(new_config) => {
-                // Rebuild analyzers with new config
-                let new_analyzers = Self::build_analyzers(&new_config);
-
-                // Update config and analyzers atomically
-                *self.config.write().await = new_config;
-                *self.analyzers.write().await = new_analyzers;
-                *self.config_version.write().await = version;
-
-                info!("Configuration updated successfully");
+        match self.apply_configure(&config, version.clone()).await {
+            Ok((hash, changed)) if changed.is_empty() => {
+                debug!(version = ?version, config_hash = %format!("{hash:016x}"), "Configuration unchanged");
+                true
+            }
+            Ok((hash, changed)) => {
+                info!(version = ?version, config_hash = %format!("{hash:016x}"), changed = ?changed, "Configuration applied");
                 true
             }
             Err(e) => {
-                warn!("Failed to parse configuration: {}", e);
+                warn!(version = ?version, error = %e, "Rejected configuration; keeping the current settings");
                 false
             }
         }
@@ -741,5 +785,126 @@ mod tests {
         let report = report.unwrap();
         assert_eq!(report.agent_id, "graphql-security");
         assert!(!report.counters.is_empty());
+    }
+
+    const ALLOWED_QUERY: &str = "{ users { id } }";
+
+    /// An agent whose allowlist (loaded from a file) holds `ALLOWED_QUERY`.
+    async fn allowlist_agent(
+        dir: &tempfile::TempDir,
+    ) -> (GraphQLSecurityAgent, std::path::PathBuf) {
+        let file = dir.path().join("allowlist.json");
+        let hash = crate::parser::calculate_query_hash(ALLOWED_QUERY);
+        std::fs::write(&file, format!(r#"{{"queries":[{{"hash":"{hash}"}}]}}"#)).unwrap();
+        let mut config = test_config();
+        config.persisted_queries.enabled = true;
+        config.persisted_queries.allowlist_file = Some(file.display().to_string());
+        let agent = GraphQLSecurityAgent::with_async_init(config).await.unwrap();
+        (agent, file)
+    }
+
+    /// Whether the allowlisted query passes and an unlisted one is refused,
+    /// i.e. the allowlist is loaded and enforced.
+    async fn allowed(agent: &GraphQLSecurityAgent) -> bool {
+        passes(agent, ALLOWED_QUERY).await && !passes(agent, "{ orders { id } }").await
+    }
+
+    async fn passes(agent: &GraphQLSecurityAgent, query: &str) -> bool {
+        let body = format!(r#"{{"query": "{query}"}}"#);
+        let result = agent
+            .analyze_request(body.as_bytes(), &HashMap::new(), "t", "127.0.0.1")
+            .await
+            .unwrap();
+        !result.has_violations()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identical_configure_twice_keeps_allowlist_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, file) = allowlist_agent(&dir).await;
+        assert!(allowed(&agent).await);
+
+        let block = serde_json::json!({ "depth": { "max_depth": 5 } });
+        assert!(agent.on_configure(block.clone(), None).await);
+        // The file is gone now; a configure that rebuilt the analyzer would
+        // come up with an empty allowlist and block everything.
+        std::fs::remove_file(&file).unwrap();
+        assert!(agent.on_configure(block.clone(), None).await);
+        assert!(agent.on_configure(block, None).await);
+        assert!(allowed(&agent).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_that_leaves_persisted_queries_alone_keeps_its_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, file) = allowlist_agent(&dir).await;
+        std::fs::remove_file(&file).unwrap();
+
+        assert!(
+            agent
+                .on_configure(serde_json::json!({ "depth": { "max_depth": 7 } }), None)
+                .await
+        );
+        assert_eq!(agent.config.read().await.depth.max_depth, 7);
+        assert!(allowed(&agent).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_configure_keeps_file_values() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        assert!(
+            agent
+                .on_configure(
+                    serde_json::json!({ "complexity": { "max_complexity": 50 } }),
+                    None
+                )
+                .await
+        );
+
+        let mut expected = test_config();
+        expected.complexity.max_complexity = 50;
+        assert_eq!(*agent.config.read().await, expected);
+        // max_depth 5 from the file still applies (the default would be 10).
+        let body = br#"{"query": "{ a { b { c { d { e { f } } } } } }"}"#;
+        let result = agent
+            .analyze_request(body, &HashMap::new(), "t", "127.0.0.1")
+            .await
+            .unwrap();
+        assert!(result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_and_bad_values_are_rejected() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        for bad in [
+            serde_json::json!({ "depth": { "max_dept": 3 } }),
+            serde_json::json!({ "dpeth": { "max_depth": 3 } }),
+            serde_json::json!({ "settings": { "fail_action": "alow" } }),
+            serde_json::json!({ "depth": { "max_depth": "deep" } }),
+            serde_json::json!({ "depth": true }),
+            serde_json::json!({ "complexity": { "list_size_arguments": ["first", " "] } }),
+            serde_json::json!({ "introspection": { "allowed_clients": "" } }),
+            serde_json::json!({ "field_auth": { "rules": [{ "fields": ["User.*"], "roles": ["a"] }] } }),
+        ] {
+            assert!(!agent.on_configure(bad.clone(), None).await, "{bad}");
+            assert_eq!(*agent.config.read().await, test_config(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_item_list_arrives_as_scalar() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        assert!(
+            agent
+                .on_configure(
+                    serde_json::json!({ "introspection": { "allowed_clients": "10.0.0.1" } }),
+                    None
+                )
+                .await
+        );
+        assert_eq!(
+            agent.config.read().await.introspection.allowed_clients,
+            vec!["10.0.0.1"]
+        );
     }
 }
