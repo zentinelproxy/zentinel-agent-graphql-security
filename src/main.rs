@@ -25,7 +25,7 @@ use zentinel_agent_protocol::v2::{GrpcAgentServerV2, UdsAgentServerV2};
 /// - Field-level authorization
 /// - Persisted queries / allowlist mode
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "zentinel-graphql-security-agent", author, version, about, long_about = None)]
 struct Args {
     /// Path to configuration file (YAML)
     #[arg(short, long, default_value = "config.yaml")]
@@ -138,4 +138,20 @@ async fn main() -> Result<()> {
 
     info!("Agent stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The release pipeline and `zentinel bundle install` expect exactly
+    /// `<binary> <version>`.
+    #[test]
+    fn version_is_binary_name_and_package_version() {
+        assert_eq!(
+            Args::command().render_version(),
+            format!("{} {}\n", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
