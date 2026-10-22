@@ -104,6 +104,14 @@ zentinel bundle install graphql-security
 
 Downloads the release binary pinned in Zentinel's bundle lock and installs it as `zentinel-graphql-security-agent`.
 
+> [!WARNING]
+> The published `0.4.0` release, which Zentinel 26.10_7's bundle lock pins,
+> was not built from its tag (it reports `zentinel-agent-graphql-security
+> 0.2.0`): it speaks the removed v1 framing on the Unix socket, so the proxy
+> never completes a handshake and, under `failure-mode "closed"`, refuses every
+> request (`503`). Use `0.5.0` or later, the first release built and
+> smoke-tested by the shared release pipeline (below).
+
 ### Release binaries
 
 Tarballs for `linux-x86_64`, `linux-aarch64` and `darwin-aarch64` are attached to each [release](https://github.com/zentinelproxy/zentinel-agent-graphql-security/releases).
@@ -126,6 +134,7 @@ The agent reads a YAML file (`-c`, default `config.yaml`); if the file does not 
 | `-s`, `--socket` | `/tmp/zentinel-graphql-security.sock` | Unix socket to listen on. |
 | `--grpc-address` | none | Listen for gRPC on this address instead of the socket, e.g. `0.0.0.0:50051`. |
 | `-l`, `--log-level` | `info` | `trace`, `debug`, `info`, `warn` or `error`. `RUST_LOG` is not read. |
+| `-V`, `--version` | | Print `zentinel-graphql-security-agent <version>` and exit. |
 
 Configuration file keys. Every section and key is optional. An unknown key is an error, in the file (the agent does not start) and in a `config { }` block (the block is rejected).
 
@@ -208,6 +217,48 @@ cargo fmt --all --check
 ```
 
 Needs stable Rust (CI uses `dtolnay/rust-toolchain@stable`) and `protoc` (CI installs `protobuf-compiler`).
+
+## Releases and smoke test
+
+Releases go through the shared agent pipeline
+([`zentinelproxy/.github`](https://github.com/zentinelproxy/.github/tree/main/agent-smoke)):
+pushing a tag `vX.Y.Z` that matches `Cargo.toml` builds `zentinel-graphql-security-agent` with
+`--locked` for `linux-x86_64`, `linux-aarch64` and `darwin-aarch64`, checks
+that `zentinel-graphql-security-agent --version` prints `zentinel-graphql-security-agent X.Y.Z`, runs
+[`scripts/smoke-test.sh`](scripts/smoke-test.sh) behind the latest Zentinel
+release on every platform, and only then publishes the tarballs
+`zentinel bundle install` downloads. CI runs the same pipeline on
+`linux-x86_64` for every push and pull request.
+
+The smoke test runs the release binary behind a real Zentinel with the agent,
+filter and route all `failure-mode "closed"`, over the Unix socket (the
+transport `zentinel bundle install` uses) and gRPC, subscribed to request headers and bodies, with the default
+configuration. It checks that a shallow query is forwarded, that a query 12
+levels deep, an introspection query, a query with 12 aliases and a batch of 6
+queries are answered by the agent the GraphQL way (`200` with an `errors`
+body carrying `DEPTH_EXCEEDED`, `INTROSPECTION_BLOCKED`, `TOO_MANY_ALIASES`,
+`TOO_MANY_BATCH_QUERIES`) instead of by the upstream, and that the request is
+refused once the agent is stopped (so the agent really is on the request
+path). The blocked queries are checked by
+[`scripts/smoke-blocked-queries.py`](scripts/smoke-blocked-queries.py): the
+proxy sends a request's headers upstream before the body has been inspected,
+so the upstream sees the start of a blocked request either way.
+
+> [!IMPORTANT]
+> Zentinel releases up to 26.10_7 send a request body to an agent only when
+> the configuration also has a `waf { }` block; without one this agent sees
+> headers only and blocks nothing. The smoke test reports that as a known
+> limitation for those releases and requires the blocks against anything
+> newer (Zentinel `main` passes).
+
+Run it locally:
+
+```bash
+gh release download 26.10_7 --repo zentinelproxy/zentinel --pattern 'zentinel-26.10_7-darwin-arm64.tar.gz*'
+shasum -a 256 -c zentinel-26.10_7-darwin-arm64.tar.gz.sha256 && tar xzf zentinel-26.10_7-darwin-arm64.tar.gz
+cargo build --release --locked
+AGENT_SMOKE=../.github/agent-smoke/smoke.py scripts/smoke-test.sh target/release/zentinel-graphql-security-agent ./zentinel
+```
 
 ## Related
 
