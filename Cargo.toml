@@ -45,6 +45,9 @@ base64 = "0.22"
 # Pattern matching for field auth rules
 glob = "0.3"
 
+# CIDR matching for introspection allowed_clients
+ipnet = "2"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 

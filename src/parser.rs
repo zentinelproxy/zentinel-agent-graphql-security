@@ -11,8 +11,10 @@ use std::collections::HashMap;
 /// A parsed GraphQL request.
 #[derive(Debug, Clone)]
 pub struct ParsedRequest {
-    /// The GraphQL query string
-    pub query: String,
+    /// The GraphQL query string. `None` for a hash-only persisted-query
+    /// request (`extensions.persistedQuery.sha256Hash` without `query`); the
+    /// query text is then resolved from a server-side store.
+    pub query: Option<String>,
     /// Operation name (if provided)
     pub operation_name: Option<String>,
     /// Variables (if provided)
@@ -93,12 +95,16 @@ fn parse_single_request(json: &Value) -> Result<ParsedRequest, Violation> {
         Violation::invalid_request(&format!("Invalid GraphQL request format: {}", e))
     })?;
 
-    let query = body
-        .query
-        .ok_or_else(|| Violation::invalid_request("Missing 'query' field in GraphQL request"))?;
+    // A request without `query` is only meaningful as a hash-only persisted
+    // query; anything else is malformed.
+    if body.query.is_none() && get_apq_hash(&body.extensions).is_none() {
+        return Err(Violation::invalid_request(
+            "Missing 'query' field in GraphQL request",
+        ));
+    }
 
     Ok(ParsedRequest {
-        query,
+        query: body.query,
         operation_name: body.operation_name,
         variables: body.variables,
         extensions: body.extensions,
@@ -406,6 +412,20 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].is_batch);
         assert_eq!(requests[0].batch_count, 2);
+    }
+
+    #[test]
+    fn test_parse_request_missing_query() {
+        let result = parse_request(br#"{"variables": {}}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_hash_only_request() {
+        let body = br#"{"extensions": {"persistedQuery": {"version": 1, "sha256Hash": "abc"}}}"#;
+        let requests = parse_request(body).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].query.is_none());
     }
 
     #[test]

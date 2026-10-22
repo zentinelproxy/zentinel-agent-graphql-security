@@ -9,11 +9,12 @@ use crate::analyzer::{
 };
 use crate::config::{canonical_config_hash, FailAction, GraphQLSecurityConfig};
 use crate::error::{graphql_error_response, GraphQLError, Violation};
-use crate::parser::{parse_query, parse_request};
+use crate::parser::{parse_query, parse_request, ParsedRequest};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use zentinel_agent_protocol::v2::{
@@ -47,6 +48,68 @@ pub struct GraphQLSecurityAgent {
     /// Hash of the last Configure payload that was applied. Held for the whole
     /// of `on_configure`, which also serialises concurrent configures.
     applied_config_hash: Mutex<Option<u64>>,
+    /// Headers and client IP of requests whose body has not arrived yet
+    pending: PendingRequests,
+}
+
+/// What the headers event tells us about a request, kept until its body
+/// arrives. The body event carries only the correlation ID, but introspection
+/// allowlists and field rules need the caller's headers and address.
+struct PendingRequest {
+    headers: HashMap<String, Vec<String>>,
+    client_ip: String,
+    seen: Instant,
+}
+
+/// Requests between their headers event and their last body chunk, by
+/// correlation ID.
+#[derive(Default)]
+struct PendingRequests {
+    inner: std::sync::Mutex<HashMap<String, PendingRequest>>,
+}
+
+impl PendingRequests {
+    /// Entries older than this are dropped (requests whose body never came).
+    const TTL: Duration = Duration::from_secs(60);
+    /// Size at which expired entries are swept.
+    const SWEEP_AT: usize = 1024;
+    /// Hard limit. A request that does not fit is analyzed without headers or
+    /// client IP, which can only make the allowlists and field rules stricter.
+    const MAX: usize = 100_000;
+
+    fn insert(&self, correlation_id: String, headers: &HashMap<String, Vec<String>>, ip: String) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= Self::SWEEP_AT {
+            map.retain(|_, p| p.seen.elapsed() < Self::TTL);
+        }
+        if map.len() >= Self::MAX {
+            warn!("Too many requests awaiting their body; analyzing this one without headers");
+            return;
+        }
+        // Header names are case-insensitive; analyzers look them up lowercased.
+        let mut lowered: HashMap<String, Vec<String>> = HashMap::with_capacity(headers.len());
+        for (name, values) in headers {
+            lowered
+                .entry(name.to_lowercase())
+                .or_default()
+                .extend(values.iter().cloned());
+        }
+        map.insert(
+            correlation_id,
+            PendingRequest {
+                headers: lowered,
+                client_ip: ip,
+                seen: Instant::now(),
+            },
+        );
+    }
+
+    fn take(&self, correlation_id: &str) -> Option<PendingRequest> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(correlation_id)
+    }
 }
 
 impl GraphQLSecurityAgent {
@@ -71,6 +134,7 @@ impl GraphQLSecurityAgent {
             requests_total: AtomicU64::new(0),
             requests_blocked: AtomicU64::new(0),
             config_version: RwLock::new(None),
+            pending: PendingRequests::default(),
         }
     }
 
@@ -225,6 +289,12 @@ impl GraphQLSecurityAgent {
 
         // Analyze each request in the batch
         for (idx, request) in requests.iter().enumerate() {
+            // Decide which query text this request stands for. The
+            // persisted-query analyzer verifies a client-supplied hash against
+            // the text, or resolves a hash-only request from its store; every
+            // analyzer then checks that text.
+            let query = Self::resolve_query(&analyzers, request)?;
+
             // Build analysis context (Send + 'static-friendly)
             let ctx = AnalysisContext {
                 correlation_id: if requests.len() > 1 {
@@ -239,7 +309,7 @@ impl GraphQLSecurityAgent {
                 extensions: request.extensions.clone(),
                 is_batch: request.is_batch,
                 batch_count: request.batch_count,
-                query: request.query.clone(),
+                query: query.clone(),
             };
 
             // Parse the query and run all analyzers within a block_in_place
@@ -253,7 +323,7 @@ impl GraphQLSecurityAgent {
             let request_result = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
 
-                let document = parse_query(&request.query)?;
+                let document = parse_query(&query)?;
 
                 let mut result = AnalysisResult::ok();
                 for analyzer in analyzers.iter() {
@@ -268,6 +338,26 @@ impl GraphQLSecurityAgent {
         }
 
         Ok(combined_result)
+    }
+
+    /// Determine the query text to analyze for one request.
+    fn resolve_query(
+        analyzers: &[Arc<dyn Analyzer>],
+        request: &ParsedRequest,
+    ) -> Result<String, Violation> {
+        for analyzer in analyzers {
+            if let Some(resolved) =
+                analyzer.resolve_query(request.query.as_deref(), &request.extensions)
+            {
+                return resolved;
+            }
+        }
+        // Without persisted queries enabled, a hash-only request cannot be
+        // analyzed and is malformed.
+        request
+            .query
+            .clone()
+            .ok_or_else(|| Violation::invalid_request("Missing 'query' field in GraphQL request"))
     }
 
     /// Build block response with GraphQL error body.
@@ -417,6 +507,10 @@ impl AgentHandlerV2 for GraphQLSecurityAgent {
         let correlation_id = event.metadata.correlation_id.clone();
         let client_ip = event.metadata.client_ip.clone();
 
+        // Keep what the body analysis needs; the body event does not repeat it.
+        self.pending
+            .insert(correlation_id.clone(), &event.headers, client_ip.clone());
+
         debug!(
             correlation_id = %correlation_id,
             client_ip = %client_ip,
@@ -464,6 +558,17 @@ impl AgentHandlerV2 for GraphQLSecurityAgent {
 
         let correlation_id = event.correlation_id.clone();
 
+        // Headers and client address from this request's headers event. If
+        // they are missing, analyze with none: allowlists and field rules then
+        // deny rather than grant.
+        let (headers, client_ip) = match self.pending.take(&correlation_id) {
+            Some(p) => (p.headers, p.client_ip),
+            None => {
+                debug!(correlation_id = %correlation_id, "No headers event seen for this body");
+                (HashMap::new(), String::new())
+            }
+        };
+
         // Decode the base64 body
         let body = match base64_decode(&event.data) {
             Some(b) => b,
@@ -480,9 +585,8 @@ impl AgentHandlerV2 for GraphQLSecurityAgent {
         drop(config);
 
         // Analyze the request
-        let headers = HashMap::new(); // Headers were in the previous event
         let result = self
-            .analyze_request(&body, &headers, &correlation_id, "unknown")
+            .analyze_request(&body, &headers, &correlation_id, &client_ip)
             .await;
 
         match result {
@@ -755,6 +859,255 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Agent with an allowlist file holding `queries`.
+    async fn allowlist_agent_with(queries: &[&str]) -> (GraphQLSecurityAgent, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        let entries: Vec<_> = queries
+            .iter()
+            .map(|q| serde_json::json!({ "query": q }))
+            .collect();
+        std::fs::write(&path, serde_json::json!({ "queries": entries }).to_string()).unwrap();
+
+        let mut config = test_config();
+        config.persisted_queries.enabled = true;
+        config.persisted_queries.allowlist_file = Some(path.to_string_lossy().into_owned());
+        let agent = GraphQLSecurityAgent::with_async_init(config).await.unwrap();
+        (agent, dir)
+    }
+
+    fn body(value: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    /// #5: a query that is not on the allowlist, sent under the hash of one
+    /// that is, must be blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persisted_query_hash_spoofing_blocked() {
+        let allowed = "{ users { id } }";
+        let (agent, _dir) = allowlist_agent_with(&[allowed]).await;
+        let allowed_hash = crate::parser::calculate_query_hash(allowed);
+
+        let request = body(serde_json::json!({
+            "query": "{ users { id passwordHash } }",
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": allowed_hash } }
+        }));
+        let result = agent
+            .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+            .await;
+        match result {
+            Err(v) => assert_eq!(v.code, crate::error::ViolationCode::QueryNotAllowed),
+            Ok(r) => assert!(r.has_violations(), "spoofed hash was allowed"),
+        }
+
+        // The allowed query itself, with or without its hash, still passes.
+        for request in [
+            body(serde_json::json!({ "query": allowed })),
+            body(serde_json::json!({
+                "query": allowed,
+                "extensions": { "persistedQuery": { "version": 1, "sha256Hash": allowed_hash } }
+            })),
+            body(serde_json::json!({
+                "extensions": { "persistedQuery": { "version": 1, "sha256Hash": allowed_hash } }
+            })),
+        ] {
+            let result = agent
+                .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+                .await
+                .expect("allowed query rejected");
+            assert!(!result.has_violations());
+        }
+    }
+
+    /// A hash-only request is analyzed with the stored text, so the other
+    /// analyzers cannot be skipped by leaving the query out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_hash_only_request_analyzed_with_stored_text() {
+        let deep = "{ a { b { c { d { e { f { g } } } } } } }";
+        let (agent, _dir) = allowlist_agent_with(&[deep]).await;
+        let hash = crate::parser::calculate_query_hash(deep);
+
+        let request = body(serde_json::json!({
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
+        }));
+        let result = agent
+            .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+            .await
+            .unwrap();
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.code == crate::error::ViolationCode::DepthExceeded));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_hash_only_request_without_persisted_queries_invalid() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        let request = body(serde_json::json!({
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "abc" } }
+        }));
+        let err = agent
+            .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ViolationCode::InvalidRequest);
+    }
+
+    fn headers_event(
+        correlation_id: &str,
+        client_ip: &str,
+        headers: &[(&str, &str)],
+    ) -> RequestHeadersEvent {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in headers {
+            map.entry(k.to_string()).or_default().push(v.to_string());
+        }
+        RequestHeadersEvent {
+            metadata: zentinel_agent_protocol::RequestMetadata {
+                correlation_id: correlation_id.to_string(),
+                request_id: correlation_id.to_string(),
+                client_ip: client_ip.to_string(),
+                client_port: 40000,
+                server_name: None,
+                protocol: "HTTP/1.1".to_string(),
+                tls_version: None,
+                tls_cipher: None,
+                route_id: None,
+                upstream_id: None,
+                timestamp: "2026-10-22T00:00:00Z".to_string(),
+                traceparent: None,
+            },
+            method: "POST".to_string(),
+            uri: "/graphql".to_string(),
+            headers: map,
+        }
+    }
+
+    fn body_event(
+        correlation_id: &str,
+        query: &str,
+    ) -> zentinel_agent_protocol::RequestBodyChunkEvent {
+        use base64::Engine;
+        let body = serde_json::json!({ "query": query }).to_string();
+        zentinel_agent_protocol::RequestBodyChunkEvent {
+            correlation_id: correlation_id.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
+            is_last: true,
+            total_size: Some(body.len()),
+            chunk_index: 0,
+            bytes_received: body.len(),
+        }
+    }
+
+    /// Send a request through the handler the way Zentinel does: headers
+    /// event first, then the body.
+    async fn send(
+        agent: &GraphQLSecurityAgent,
+        id: &str,
+        client_ip: &str,
+        headers: &[(&str, &str)],
+        query: &str,
+    ) -> bool {
+        agent
+            .on_request_headers(headers_event(id, client_ip, headers))
+            .await;
+        let response = agent.on_request_body_chunk(body_event(id, query)).await;
+        matches!(response.decision, Decision::Block { .. })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_introspection_allowlist_sees_request_headers() {
+        let mut config = test_config();
+        config.introspection.allowed_clients = vec!["let-me-in".to_string()];
+        config.introspection.allowed_clients_header = Some("X-Introspection-Key".to_string());
+        let agent = GraphQLSecurityAgent::new(config).unwrap();
+        let q = "{ __schema { types { name } } }";
+
+        assert!(
+            !send(
+                &agent,
+                "a",
+                "203.0.113.9",
+                &[("X-Introspection-Key", "let-me-in")],
+                q
+            )
+            .await,
+            "allowed key was blocked"
+        );
+        assert!(
+            send(
+                &agent,
+                "b",
+                "203.0.113.9",
+                &[("X-Introspection-Key", "nope")],
+                q
+            )
+            .await
+        );
+        assert!(send(&agent, "c", "203.0.113.9", &[], q).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_introspection_allowlist_sees_client_ip() {
+        let mut config = test_config();
+        config.introspection.allowed_clients = vec!["203.0.113.9".to_string()];
+        let agent = GraphQLSecurityAgent::new(config).unwrap();
+        let q = "{ __schema { types { name } } }";
+
+        assert!(!send(&agent, "a", "203.0.113.9", &[], q).await);
+        assert!(send(&agent, "b", "198.51.100.1", &[], q).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_field_auth_sees_request_headers() {
+        let mut config = test_config();
+        config.field_auth.enabled = true;
+        config.field_auth.rules = vec![crate::config::FieldAuthRule {
+            fields: vec!["Query.adminStats".to_string()],
+            require_roles: vec!["admin".to_string()],
+            roles_header: None,
+            require_scopes: vec![],
+            scopes_header: None,
+        }];
+        let agent = GraphQLSecurityAgent::new(config).unwrap();
+        let q = "{ adminStats { count } }";
+
+        assert!(
+            !send(
+                &agent,
+                "a",
+                "203.0.113.9",
+                &[("X-User-Roles", "user, admin")],
+                q
+            )
+            .await,
+            "caller with the required role was denied"
+        );
+        assert!(send(&agent, "b", "203.0.113.9", &[("X-User-Roles", "user")], q).await);
+        assert!(send(&agent, "c", "203.0.113.9", &[], q).await);
+        // Fields no rule matches stay open.
+        assert!(!send(&agent, "d", "203.0.113.9", &[], "{ users { id } }").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_body_without_headers_event_fails_closed() {
+        let mut config = test_config();
+        config.introspection.allowed_clients = vec!["let-me-in".to_string()];
+        config.introspection.allowed_clients_header = Some("x-introspection-key".to_string());
+        let agent = GraphQLSecurityAgent::new(config).unwrap();
+
+        let response = agent
+            .on_request_body_chunk(body_event("orphan", "{ __schema { types { name } } }"))
+            .await;
+        assert!(matches!(response.decision, Decision::Block { .. }));
+        // The entry is consumed by the body and does not linger.
+        agent
+            .on_request_headers(headers_event("x", "203.0.113.9", &[]))
+            .await;
+        agent.on_request_body_chunk(body_event("x", "{ a }")).await;
+        assert!(agent.pending.take("x").is_none());
+    }
+
     #[test]
     fn test_capabilities() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
@@ -847,6 +1200,78 @@ mod tests {
         );
         assert_eq!(agent.config.read().await.depth.max_depth, 7);
         assert!(allowed(&agent).await);
+    }
+
+    /// A config push that turns persisted queries on loads the allowlist
+    /// file: listed queries (by text, and hash-only) keep working, others and
+    /// spoofed hashes are refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_enabling_persisted_queries_loads_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("allowlist.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({ "queries": [{ "query": ALLOWED_QUERY }] }).to_string(),
+        )
+        .unwrap();
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        assert!(passes(&agent, "{ orders { id } }").await);
+
+        let block = serde_json::json!({
+            "persisted_queries": { "enabled": true, "allowlist_file": file.display().to_string() }
+        });
+        assert!(agent.on_configure(block.clone(), None).await);
+        assert!(allowed(&agent).await);
+
+        let hash = crate::parser::calculate_query_hash(ALLOWED_QUERY);
+        let hash_only = serde_json::json!({
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
+        })
+        .to_string();
+        let result = agent
+            .analyze_request(hash_only.as_bytes(), &HashMap::new(), "t", "127.0.0.1")
+            .await
+            .unwrap();
+        assert!(!result.has_violations());
+
+        let spoofed = serde_json::json!({
+            "query": "{ orders { id } }",
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
+        })
+        .to_string();
+        assert!(agent
+            .analyze_request(spoofed.as_bytes(), &HashMap::new(), "t", "127.0.0.1")
+            .await
+            .is_err());
+
+        // Pushing the same block again (e.g. on reconnect) keeps it working.
+        assert!(agent.on_configure(block, None).await);
+        assert!(allowed(&agent).await);
+    }
+
+    /// An allowlist file that cannot be loaded rejects the configure and
+    /// leaves the running allowlist in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_with_unloadable_allowlist_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _file) = allowlist_agent(&dir).await;
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        let mismatched = dir.path().join("mismatched.json");
+        std::fs::write(
+            &mismatched,
+            serde_json::json!({ "queries": [{ "hash": "abcd", "query": ALLOWED_QUERY }] })
+                .to_string(),
+        )
+        .unwrap();
+        for path in [bad, mismatched] {
+            let block = serde_json::json!({
+                "persisted_queries": { "enabled": true, "allowlist_file": path.display().to_string() }
+            });
+            assert!(!agent.on_configure(block, None).await, "{}", path.display());
+            assert!(allowed(&agent).await);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
