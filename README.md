@@ -152,7 +152,7 @@ Configuration file keys. Every section and key is optional. An unknown key is an
 | `introspection.enabled` | `true` | Enable introspection control. |
 | `introspection.allow` | `false` | Allow introspection for everyone. |
 | `introspection.allow_typename` | `true` | Allow `__typename`. |
-| `introspection.allowed_clients` | empty | Exact client IPs or header values allowed to introspect (no CIDR). |
+| `introspection.allowed_clients` | empty | Who may introspect: client IPs and CIDR ranges (`10.0.0.0/8`, `2001:db8::/32`), matched against the client address Zentinel reports, and any other strings, matched exactly against the `allowed_clients_header` value. An IP or range entry is never accepted as a header value. |
 | `introspection.allowed_clients_header` | none | Header whose value is compared with `allowed_clients`. |
 | `field_auth.enabled` | `false` | Enable field rules. A caller gets a field a rule matches if it has any of the rule's roles or scopes; fields no rule matches are open. |
 | `field_auth.rules[]` | empty | `fields` (glob patterns), `require_roles` / `require_scopes` (any of), `roles_header` / `scopes_header` (defaults `x-user-roles`, `x-user-scopes`). |

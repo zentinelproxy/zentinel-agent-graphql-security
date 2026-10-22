@@ -8,18 +8,52 @@ use crate::error::Violation;
 use crate::parser::{FragmentInfo, ParsedDocument};
 use apollo_parser::cst;
 use async_trait::async_trait;
+use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
-use tracing::debug;
+use std::net::IpAddr;
+use tracing::{debug, warn};
 
 /// Analyzer that controls introspection queries.
 pub struct IntrospectionAnalyzer {
     config: IntrospectionConfig,
+    /// `allowed_clients` entries that are IP addresses or CIDR ranges
+    allowed_networks: Vec<IpNet>,
+    /// The other `allowed_clients` entries: values for `allowed_clients_header`
+    allowed_header_values: HashSet<String>,
 }
 
 impl IntrospectionAnalyzer {
     /// Create a new introspection analyzer.
     pub fn new(config: IntrospectionConfig) -> Self {
-        Self { config }
+        let mut allowed_networks = Vec::new();
+        let mut allowed_header_values = HashSet::new();
+        for entry in &config.allowed_clients {
+            let entry = entry.trim();
+            if let Ok(net) = entry.parse::<IpNet>() {
+                allowed_networks.push(net.trunc());
+            } else if let Ok(ip) = entry.parse::<IpAddr>() {
+                allowed_networks.push(IpNet::from(ip.to_canonical()));
+            } else if entry.contains('/')
+                && entry
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || ".:/".contains(c))
+            {
+                // Looks like a mistyped range; never let it become a header secret.
+                warn!(entry = %entry, "Ignoring invalid CIDR in introspection.allowed_clients");
+            } else {
+                allowed_header_values.insert(entry.to_string());
+            }
+        }
+        if !allowed_header_values.is_empty() && config.allowed_clients_header.is_none() {
+            warn!(
+                "introspection.allowed_clients has non-IP entries but no allowed_clients_header; they never match"
+            );
+        }
+        Self {
+            config,
+            allowed_networks,
+            allowed_header_values,
+        }
     }
 
     /// Check if a selection set contains introspection fields.
@@ -131,19 +165,20 @@ impl IntrospectionAnalyzer {
             return true;
         }
 
-        // Check if client IP is in allowlist
-        if self.config.allowed_clients.contains(&ctx.client_ip) {
-            return true;
+        // Client address (as reported by Zentinel) in an allowed IP or range.
+        // An address that does not parse matches nothing.
+        if let Ok(ip) = ctx.client_ip.trim().parse::<IpAddr>() {
+            let ip = ip.to_canonical();
+            if self.allowed_networks.iter().any(|net| net.contains(&ip)) {
+                return true;
+            }
         }
 
-        // Check header-based allowlist
+        // Header-based allowlist. Only the non-IP entries are secrets; an IP
+        // entry sent as the header value must not grant access.
         if let Some(ref header_name) = self.config.allowed_clients_header {
             if let Some(header_value) = ctx.header(header_name) {
-                if self
-                    .config
-                    .allowed_clients
-                    .contains(&header_value.to_string())
-                {
+                if self.allowed_header_values.contains(header_value.trim()) {
                     return true;
                 }
             }
@@ -317,6 +352,61 @@ mod tests {
         let result = analyzer.analyze(&doc, &ctx).await;
 
         assert!(!result.has_violations());
+    }
+
+    async fn introspection_blocked_for(config: IntrospectionConfig, ctx: &AnalysisContext) -> bool {
+        let analyzer = IntrospectionAnalyzer::new(config);
+        let doc = parse_query("{ __schema { types { name } } }").unwrap();
+        analyzer.analyze(&doc, ctx).await.has_violations()
+    }
+
+    fn ctx_from(ip: &str) -> AnalysisContext {
+        let mut ctx = test_context();
+        ctx.client_ip = ip.to_string();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn test_introspection_allowed_by_cidr() {
+        let mut config = test_config();
+        config.allowed_clients = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+
+        assert!(!introspection_blocked_for(config.clone(), &ctx_from("10.1.2.3")).await);
+        assert!(!introspection_blocked_for(config.clone(), &ctx_from("2001:db8::1")).await);
+        // IPv4-mapped IPv6 form of an allowed IPv4 address
+        assert!(!introspection_blocked_for(config.clone(), &ctx_from("::ffff:10.1.2.3")).await);
+        assert!(introspection_blocked_for(config.clone(), &ctx_from("11.0.0.1")).await);
+        assert!(introspection_blocked_for(config.clone(), &ctx_from("2001:db9::1")).await);
+        // No usable address matches nothing.
+        assert!(introspection_blocked_for(config.clone(), &ctx_from("unknown")).await);
+        assert!(introspection_blocked_for(config, &ctx_from("")).await);
+    }
+
+    #[tokio::test]
+    async fn test_introspection_exact_ip_and_host_bits() {
+        let mut config = test_config();
+        config.allowed_clients = vec!["192.0.2.7".to_string(), "198.51.100.77/24".to_string()];
+
+        assert!(!introspection_blocked_for(config.clone(), &ctx_from("192.0.2.7")).await);
+        assert!(introspection_blocked_for(config.clone(), &ctx_from("192.0.2.8")).await);
+        assert!(!introspection_blocked_for(config.clone(), &ctx_from("198.51.100.1")).await);
+    }
+
+    #[tokio::test]
+    async fn test_ip_entry_is_not_a_header_secret() {
+        let mut config = test_config();
+        config.allowed_clients = vec!["127.0.0.1".to_string(), "10.0.0.0/8".to_string()];
+        config.allowed_clients_header = Some("x-introspection-key".to_string());
+
+        for value in ["127.0.0.1", "10.0.0.0/8"] {
+            let mut ctx = ctx_from("203.0.113.5");
+            ctx.headers
+                .insert("x-introspection-key".to_string(), vec![value.to_string()]);
+            assert!(
+                introspection_blocked_for(config.clone(), &ctx).await,
+                "header value {value} granted introspection"
+            );
+        }
     }
 
     #[tokio::test]
