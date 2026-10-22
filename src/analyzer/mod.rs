@@ -176,6 +176,20 @@ pub trait Analyzer: Send + Sync {
 
     /// Analyze a parsed GraphQL document.
     async fn analyze(&self, document: &ParsedDocument, ctx: &AnalysisContext) -> AnalysisResult;
+
+    /// Decide which query text a request stands for, before it is parsed.
+    ///
+    /// `query` is the text the client sent (`None` for a hash-only persisted
+    /// query). Returning `None` means this analyzer has no opinion; `Some(Ok)`
+    /// is the text every analyzer then sees, `Some(Err)` rejects the request.
+    /// Only the persisted-query analyzer implements this.
+    fn resolve_query(
+        &self,
+        _query: Option<&str>,
+        _extensions: &Option<serde_json::Value>,
+    ) -> Option<Result<String, Violation>> {
+        None
+    }
 }
 
 #[cfg(test)]

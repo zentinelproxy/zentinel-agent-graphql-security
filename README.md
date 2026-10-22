@@ -157,11 +157,13 @@ Configuration file keys. Every section and key is optional. An unknown key is an
 | `field_auth.enabled` | `false` | Enable field rules. Not usable yet, see below. |
 | `field_auth.rules[]` | empty | `fields` (glob patterns), `require_roles` / `require_scopes` (any of), `roles_header` / `scopes_header` (defaults `x-user-roles`, `x-user-scopes`). |
 | `persisted_queries.enabled` | `false` | Enable the allowlist. |
-| `persisted_queries.mode` | `allowlist` | `allowlist` permits only listed hashes; `cache` permits everything and does nothing else. |
-| `persisted_queries.allowlist_file` | none | JSON file `{"queries":[{"hash":"<sha256 hex>","name":"..."}]}`, loaded at start. A missing file means an empty list. |
+| `persisted_queries.mode` | `allowlist` | `allowlist` permits only listed queries; `cache` permits every query and remembers it, so later hash-only requests for it can be analyzed. |
+| `persisted_queries.allowlist_file` | none | JSON file `{"queries":[{"query":"<text>","name":"..."}]}`, loaded at start. An entry may give `hash` (SHA-256 hex) instead of, or as well as, `query`; with both, they must agree or the agent refuses to start. A missing file means an empty list. |
 | `persisted_queries.require_hash` | `false` | Reject requests without `extensions.persistedQuery.sha256Hash`. |
 
 The hash of a query is the SHA-256 of its text with surrounding whitespace trimmed (`printf '%s' '{ users { id } }' | shasum -a 256`), compared case-insensitively.
+
+The agent always hashes the query text it received itself; the client's `extensions.persistedQuery.sha256Hash` is never taken on trust. A request whose hash does not match its `query` is rejected with `QUERY_NOT_ALLOWED`. A hash-only request (no `query`) is analyzed with the text the agent has for that hash: the allowlist entry's `query` in `allowlist` mode, or a query seen earlier with that hash in `cache` mode (up to 10,000 are kept, in memory). If the agent has no text for the hash it answers `PERSISTED_QUERY_NOT_FOUND` (message `PersistedQueryNotFound`, which Apollo-style clients answer by resending with the full query); a hash that is not on the allowlist at all gets `QUERY_NOT_ALLOWED`. The upstream still receives the hash-only body and must resolve it itself.
 
 ### Configuration from Zentinel
 
@@ -188,14 +190,13 @@ Full reference: <https://registry.zentinelproxy.io/graphql-security/>
 
 - **Body only.** The headers event is always answered with "allow, send the body"; analysis runs on the final body chunk. `GET` requests with the query in the URL are not inspected, and the proxy only sends bodies when `waf { body-inspection { inspect-request-body #true } }` is set and the content type matches. Use `request-body-mode "buffer"` and a `max-inspection-bytes` at least as large as `settings.max_body_size`: the agent analyzes only the last chunk it receives, and a body cut off at the inspection limit is allowed without analysis.
 - **Analyzers:** depth, complexity, aliases, batch (JSON array of operations), introspection, field rules and persisted queries. Every operation in a batch is analyzed, and all violations are reported together.
-- **Block response:** status 200 and `{"errors":[{"message", "extensions":{"code","zentinel":true, "actual", "max", "field"}}]}`. Codes: `DEPTH_EXCEEDED`, `COMPLEXITY_EXCEEDED`, `TOO_MANY_ALIASES`, `TOO_MANY_BATCH_QUERIES`, `INTROSPECTION_BLOCKED`, `FIELD_UNAUTHORIZED`, `QUERY_NOT_ALLOWED`, `PARSE_ERROR`, `INVALID_REQUEST` (not JSON, no `query`, or too large). The agent asks for `Content-Type: application/json` as a response-header operation, which Zentinel 0.6.50 does not apply to a block decided on the body.
+- **Block response:** status 200 and `{"errors":[{"message", "extensions":{"code","zentinel":true, "actual", "max", "field"}}]}`. Codes: `DEPTH_EXCEEDED`, `COMPLEXITY_EXCEEDED`, `TOO_MANY_ALIASES`, `TOO_MANY_BATCH_QUERIES`, `INTROSPECTION_BLOCKED`, `FIELD_UNAUTHORIZED`, `QUERY_NOT_ALLOWED`, `PERSISTED_QUERY_NOT_FOUND`, `PARSE_ERROR`, `INVALID_REQUEST` (not JSON, no `query` and no persisted-query hash, or too large). The agent asks for `Content-Type: application/json` as a response-header operation, which Zentinel 0.6.50 does not apply to a block decided on the body.
 - **Complexity** is an estimate without a schema: each field costs its configured cost, and the fields under it are multiplied by its list-size argument or `default_list_multiplier`. Multipliers apply one level down and do not compound.
 - **Metrics** over the agent protocol: `graphql_security_requests_total`, `graphql_security_requests_blocked_total`, `graphql_security_block_rate_percent`.
 
 Known limitations in the current code:
 
 - **Field rules and introspection allowlists cannot see the request.** The body is analyzed with no headers and the client IP `unknown`, so `allowed_clients` never matches, and with `field_auth` enabled every field a rule matches is denied regardless of the caller's roles. Nested selector patterns such as `User.email` only match through fragments, because nested field types are unknown without a schema.
-- **Persisted queries trust the client's hash.** In `allowlist` mode an `extensions.persistedQuery.sha256Hash` value is checked instead of the query's own hash, so a client can send any query with a listed hash. Hash-only (APQ) requests without a `query` are rejected as `INVALID_REQUEST`.
 
 ## Development
 

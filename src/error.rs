@@ -22,6 +22,8 @@ pub enum ViolationCode {
     FieldUnauthorized,
     /// Query not in allowlist
     QueryNotAllowed,
+    /// Hash-only persisted query whose text is not known to the agent
+    PersistedQueryNotFound,
     /// GraphQL parse error
     ParseError,
     /// Invalid request format
@@ -39,6 +41,7 @@ impl ViolationCode {
             Self::IntrospectionBlocked => "INTROSPECTION_BLOCKED",
             Self::FieldUnauthorized => "FIELD_UNAUTHORIZED",
             Self::QueryNotAllowed => "QUERY_NOT_ALLOWED",
+            Self::PersistedQueryNotFound => "PERSISTED_QUERY_NOT_FOUND",
             Self::ParseError => "PARSE_ERROR",
             Self::InvalidRequest => "INVALID_REQUEST",
         }
@@ -202,6 +205,26 @@ impl Violation {
         Self::new(
             ViolationCode::QueryNotAllowed,
             "Query is not in the allowlist",
+        )
+    }
+
+    /// Create a persisted-query-not-found violation.
+    ///
+    /// The message is `PersistedQueryNotFound`, which is what Apollo-style APQ
+    /// clients look for before retrying with the full query text.
+    pub fn persisted_query_not_found() -> Self {
+        Self::new(
+            ViolationCode::PersistedQueryNotFound,
+            "PersistedQueryNotFound",
+        )
+    }
+
+    /// Create a violation for a persisted-query hash that does not match the
+    /// query text it was sent with.
+    pub fn persisted_query_hash_mismatch() -> Self {
+        Self::new(
+            ViolationCode::QueryNotAllowed,
+            "Persisted query hash does not match the query text",
         )
     }
 

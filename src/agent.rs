@@ -9,7 +9,7 @@ use crate::analyzer::{
 };
 use crate::config::{canonical_config_hash, FailAction, GraphQLSecurityConfig};
 use crate::error::{graphql_error_response, GraphQLError, Violation};
-use crate::parser::{parse_query, parse_request};
+use crate::parser::{parse_query, parse_request, ParsedRequest};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,6 +225,12 @@ impl GraphQLSecurityAgent {
 
         // Analyze each request in the batch
         for (idx, request) in requests.iter().enumerate() {
+            // Decide which query text this request stands for. The
+            // persisted-query analyzer verifies a client-supplied hash against
+            // the text, or resolves a hash-only request from its store; every
+            // analyzer then checks that text.
+            let query = Self::resolve_query(&analyzers, request)?;
+
             // Build analysis context (Send + 'static-friendly)
             let ctx = AnalysisContext {
                 correlation_id: if requests.len() > 1 {
@@ -239,7 +245,7 @@ impl GraphQLSecurityAgent {
                 extensions: request.extensions.clone(),
                 is_batch: request.is_batch,
                 batch_count: request.batch_count,
-                query: request.query.clone(),
+                query: query.clone(),
             };
 
             // Parse the query and run all analyzers within a block_in_place
@@ -253,7 +259,7 @@ impl GraphQLSecurityAgent {
             let request_result = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
 
-                let document = parse_query(&request.query)?;
+                let document = parse_query(&query)?;
 
                 let mut result = AnalysisResult::ok();
                 for analyzer in analyzers.iter() {
@@ -268,6 +274,26 @@ impl GraphQLSecurityAgent {
         }
 
         Ok(combined_result)
+    }
+
+    /// Determine the query text to analyze for one request.
+    fn resolve_query(
+        analyzers: &[Arc<dyn Analyzer>],
+        request: &ParsedRequest,
+    ) -> Result<String, Violation> {
+        for analyzer in analyzers {
+            if let Some(resolved) =
+                analyzer.resolve_query(request.query.as_deref(), &request.extensions)
+            {
+                return resolved;
+            }
+        }
+        // Without persisted queries enabled, a hash-only request cannot be
+        // analyzed and is malformed.
+        request
+            .query
+            .clone()
+            .ok_or_else(|| Violation::invalid_request("Missing 'query' field in GraphQL request"))
     }
 
     /// Build block response with GraphQL error body.
@@ -753,6 +779,100 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    /// Agent with an allowlist file holding `queries`.
+    async fn allowlist_agent(queries: &[&str]) -> (GraphQLSecurityAgent, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        let entries: Vec<_> = queries
+            .iter()
+            .map(|q| serde_json::json!({ "query": q }))
+            .collect();
+        std::fs::write(&path, serde_json::json!({ "queries": entries }).to_string()).unwrap();
+
+        let mut config = test_config();
+        config.persisted_queries.enabled = true;
+        config.persisted_queries.allowlist_file = Some(path.to_string_lossy().into_owned());
+        let agent = GraphQLSecurityAgent::with_async_init(config).await.unwrap();
+        (agent, dir)
+    }
+
+    fn body(value: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    /// #5: a query that is not on the allowlist, sent under the hash of one
+    /// that is, must be blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persisted_query_hash_spoofing_blocked() {
+        let allowed = "{ users { id } }";
+        let (agent, _dir) = allowlist_agent(&[allowed]).await;
+        let allowed_hash = crate::parser::calculate_query_hash(allowed);
+
+        let request = body(serde_json::json!({
+            "query": "{ users { id passwordHash } }",
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": allowed_hash } }
+        }));
+        let result = agent
+            .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+            .await;
+        match result {
+            Err(v) => assert_eq!(v.code, crate::error::ViolationCode::QueryNotAllowed),
+            Ok(r) => assert!(r.has_violations(), "spoofed hash was allowed"),
+        }
+
+        // The allowed query itself, with or without its hash, still passes.
+        for request in [
+            body(serde_json::json!({ "query": allowed })),
+            body(serde_json::json!({
+                "query": allowed,
+                "extensions": { "persistedQuery": { "version": 1, "sha256Hash": allowed_hash } }
+            })),
+            body(serde_json::json!({
+                "extensions": { "persistedQuery": { "version": 1, "sha256Hash": allowed_hash } }
+            })),
+        ] {
+            let result = agent
+                .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+                .await
+                .expect("allowed query rejected");
+            assert!(!result.has_violations());
+        }
+    }
+
+    /// A hash-only request is analyzed with the stored text, so the other
+    /// analyzers cannot be skipped by leaving the query out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_hash_only_request_analyzed_with_stored_text() {
+        let deep = "{ a { b { c { d { e { f { g } } } } } } }";
+        let (agent, _dir) = allowlist_agent(&[deep]).await;
+        let hash = crate::parser::calculate_query_hash(deep);
+
+        let request = body(serde_json::json!({
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
+        }));
+        let result = agent
+            .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+            .await
+            .unwrap();
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.code == crate::error::ViolationCode::DepthExceeded));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_hash_only_request_without_persisted_queries_invalid() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        let request = body(serde_json::json!({
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "abc" } }
+        }));
+        let err = agent
+            .analyze_request(&request, &HashMap::new(), "test", "127.0.0.1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ViolationCode::InvalidRequest);
     }
 
     #[test]
