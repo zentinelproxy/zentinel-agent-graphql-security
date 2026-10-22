@@ -118,7 +118,7 @@ Installs `zentinel-graphql-security-agent`.
 
 ## Configuration
 
-The agent reads a YAML file (`-c`, default `config.yaml`); if the file does not exist it starts with the defaults. It also accepts configuration over the protocol (`on_configure`), but Zentinel 0.6.50 does not forward an `agent { config { ... } }` block, so set it here.
+The agent reads a YAML file (`-c`, default `config.yaml`); if the file does not exist it starts with the defaults. An `agent { config { ... } }` block in the Zentinel configuration can override file settings; see [Configuration from Zentinel](#configuration-from-zentinel).
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -127,7 +127,7 @@ The agent reads a YAML file (`-c`, default `config.yaml`); if the file does not 
 | `--grpc-address` | none | Listen for gRPC on this address instead of the socket, e.g. `0.0.0.0:50051`. |
 | `-l`, `--log-level` | `info` | `trace`, `debug`, `info`, `warn` or `error`. `RUST_LOG` is not read. |
 
-Configuration file keys. Every section is optional; unknown keys are ignored, so check spelling.
+Configuration file keys. Every section and key is optional. An unknown key is an error, in the file (the agent does not start) and in a `config { }` block (the block is rejected).
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -162,6 +162,25 @@ Configuration file keys. Every section is optional; unknown keys are ignored, so
 | `persisted_queries.require_hash` | `false` | Reject requests without `extensions.persistedQuery.sha256Hash`. |
 
 The hash of a query is the SHA-256 of its text with surrounding whitespace trimmed (`printf '%s' '{ users { id } }' | shasum -a 256`), compared case-insensitively.
+
+### Configuration from Zentinel
+
+Zentinel releases that include zentinelproxy/zentinel#603 send the agent's `config { }` block on every connection: once for each pooled connection at startup, and again on every reconnect. The block uses the same keys as the file (snake_case, nested by section) and is applied by one rule:
+
+- **Merge, don't replace.** The block is laid over the file (or the defaults when there is no file). Sections and keys it leaves out keep their file value; a map such as `complexity.field_costs` gains or changes the entries the block names. A list (`list_size_arguments`, `allowed_clients`, `field_auth.rules`) is replaced as a whole. The same block always yields the same settings.
+- **Idempotent.** A block identical to the one already applied (compared by a hash of its canonical JSON), or one that changes nothing, keeps the running analyzers. When it changes settings, the persisted-query analyzer and its loaded allowlist are kept unless `persisted_queries` itself changed; a changed `persisted_queries` reloads the allowlist file.
+- **Strict.** An unknown key, a value of the wrong type, a blank list entry or an allowlist file that cannot be read rejects the whole block: the agent answers the Configure with failure, keeps its current settings and logs the reason. A single value where a list is expected is a one-item list (that is how Zentinel encodes a KDL node with one argument).
+- **No secrets in logs.** The agent logs the block's hash and the dotted names of the settings that changed, never the block itself.
+
+```kdl
+agent "graphql-security" type="custom" {
+    unix-socket "/tmp/zentinel-graphql-security.sock"
+    config {
+        depth { max_depth 8 }
+        introspection { allowed_clients "10.0.0.5" }
+    }
+}
+```
 
 Full reference: <https://registry.zentinelproxy.io/graphql-security/>
 

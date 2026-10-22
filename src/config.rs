@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Main configuration for the GraphQL Security agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GraphQLSecurityConfig {
     /// Config version
     pub version: String,
@@ -52,8 +52,8 @@ impl Default for GraphQLSecurityConfig {
 }
 
 /// General settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SettingsConfig {
     /// Maximum body size to process (bytes)
     pub max_body_size: usize,
@@ -87,8 +87,8 @@ pub enum FailAction {
 }
 
 /// Depth limiting configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DepthConfig {
     /// Enable depth limiting
     pub enabled: bool,
@@ -111,8 +111,8 @@ impl Default for DepthConfig {
 }
 
 /// Complexity/cost analysis configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ComplexityConfig {
     /// Enable complexity analysis
     pub enabled: bool,
@@ -156,8 +156,8 @@ impl Default for ComplexityConfig {
 }
 
 /// Alias limiting configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AliasConfig {
     /// Enable alias limiting
     pub enabled: bool,
@@ -180,8 +180,8 @@ impl Default for AliasConfig {
 }
 
 /// Batch query limiting configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BatchConfig {
     /// Enable batch query limiting
     pub enabled: bool,
@@ -200,8 +200,8 @@ impl Default for BatchConfig {
 }
 
 /// Introspection control configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct IntrospectionConfig {
     /// Enable introspection control
     pub enabled: bool,
@@ -232,8 +232,8 @@ impl Default for IntrospectionConfig {
 }
 
 /// Field-level authorization configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FieldAuthConfig {
     /// Enable field-level authorization
     pub enabled: bool,
@@ -243,7 +243,8 @@ pub struct FieldAuthConfig {
 }
 
 /// Single field authorization rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldAuthRule {
     /// Fields this rule applies to (supports glob patterns like "User.*")
     pub fields: Vec<String>,
@@ -266,8 +267,8 @@ pub struct FieldAuthRule {
 }
 
 /// Persisted queries / allowlist configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PersistedQueriesConfig {
     /// Enable persisted queries
     pub enabled: bool,
@@ -302,6 +303,151 @@ pub enum PersistedQueryMode {
     Allowlist,
     /// Any query is allowed, cached for performance
     Cache,
+}
+
+impl GraphQLSecurityConfig {
+    /// This configuration with a `config { }` block laid over it.
+    ///
+    /// Objects are merged key by key, so a key the block leaves out keeps the
+    /// value it has here (from the YAML file or the defaults); scalars and
+    /// lists replace. A scalar given where a list is expected is a one-item
+    /// list (that is how the proxy encodes a KDL node with one argument).
+    /// Unknown keys, wrong types and blank list entries are errors.
+    pub fn overlay(&self, block: &serde_json::Value) -> Result<Self, String> {
+        if !block.is_object() {
+            return Err("the config block must be an object".to_string());
+        }
+        let mut merged = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        merge_json(&mut merged, block, "")?;
+        serde_json::from_value(merged).map_err(|e| e.to_string())
+    }
+
+    /// The dotted paths of the settings that differ between `self` and `other`.
+    pub fn changed_keys(&self, other: &Self) -> Vec<String> {
+        let (a, b) = match (serde_json::to_value(self), serde_json::to_value(other)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return vec!["<unserializable>".to_string()],
+        };
+        let mut out = Vec::new();
+        diff_json(&a, &b, "", &mut out);
+        out
+    }
+}
+
+fn join_path(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+fn merge_json(
+    base: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    use serde_json::Value;
+    match (base, patch) {
+        (Value::Object(base), Value::Object(patch)) => {
+            for (key, value) in patch {
+                let key_path = join_path(path, key);
+                match base.get_mut(key) {
+                    Some(existing) => merge_json(existing, value, &key_path)?,
+                    // Not a known key here: keep it so deserializing rejects it
+                    // as an unknown field (or a map gains the entry).
+                    None => {
+                        check_entries(value, &key_path)?;
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base @ Value::Array(_), Value::Array(items)) => {
+            check_entries(patch, path)?;
+            *base = Value::Array(items.clone());
+        }
+        (base @ Value::Array(_), scalar) if !scalar.is_null() => {
+            let wrapped = Value::Array(vec![scalar.clone()]);
+            check_entries(&wrapped, path)?;
+            *base = wrapped;
+        }
+        (base, value) => *base = value.clone(),
+    }
+    Ok(())
+}
+
+/// A blank string in a list is a typo, not a value: reject it rather than let
+/// a list quietly become one that matches nothing (or everything).
+fn check_entries(value: &serde_json::Value, path: &str) -> Result<(), String> {
+    if let serde_json::Value::Array(items) = value {
+        if items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|s| s.trim().is_empty()))
+        {
+            return Err(format!("`{path}` has a blank entry"));
+        }
+    }
+    Ok(())
+}
+
+fn diff_json(a: &serde_json::Value, b: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(a), Value::Object(b)) => {
+            let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                let key_path = join_path(path, key);
+                match (a.get(key), b.get(key)) {
+                    (Some(x), Some(y)) => diff_json(x, y, &key_path, out),
+                    _ => out.push(key_path),
+                }
+            }
+        }
+        (a, b) if a != b => out.push(path.to_string()),
+        _ => {}
+    }
+}
+
+/// A stable hash of a JSON value with its object keys in sorted order, so two
+/// payloads that differ only in key order hash the same (FNV-1a, 64 bit).
+pub fn canonical_config_hash(value: &serde_json::Value) -> u64 {
+    fn write(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                    out.push(':');
+                    write(&map[k], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    let mut canonical = String::new();
+    write(value, &mut canonical);
+    canonical.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 #[cfg(test)]
