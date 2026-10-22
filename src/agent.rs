@@ -1202,6 +1202,78 @@ mod tests {
         assert!(allowed(&agent).await);
     }
 
+    /// A config push that turns persisted queries on loads the allowlist
+    /// file: listed queries (by text, and hash-only) keep working, others and
+    /// spoofed hashes are refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_enabling_persisted_queries_loads_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("allowlist.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({ "queries": [{ "query": ALLOWED_QUERY }] }).to_string(),
+        )
+        .unwrap();
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        assert!(passes(&agent, "{ orders { id } }").await);
+
+        let block = serde_json::json!({
+            "persisted_queries": { "enabled": true, "allowlist_file": file.display().to_string() }
+        });
+        assert!(agent.on_configure(block.clone(), None).await);
+        assert!(allowed(&agent).await);
+
+        let hash = crate::parser::calculate_query_hash(ALLOWED_QUERY);
+        let hash_only = serde_json::json!({
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
+        })
+        .to_string();
+        let result = agent
+            .analyze_request(hash_only.as_bytes(), &HashMap::new(), "t", "127.0.0.1")
+            .await
+            .unwrap();
+        assert!(!result.has_violations());
+
+        let spoofed = serde_json::json!({
+            "query": "{ orders { id } }",
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
+        })
+        .to_string();
+        assert!(agent
+            .analyze_request(spoofed.as_bytes(), &HashMap::new(), "t", "127.0.0.1")
+            .await
+            .is_err());
+
+        // Pushing the same block again (e.g. on reconnect) keeps it working.
+        assert!(agent.on_configure(block, None).await);
+        assert!(allowed(&agent).await);
+    }
+
+    /// An allowlist file that cannot be loaded rejects the configure and
+    /// leaves the running allowlist in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_with_unloadable_allowlist_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _file) = allowlist_agent(&dir).await;
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        let mismatched = dir.path().join("mismatched.json");
+        std::fs::write(
+            &mismatched,
+            serde_json::json!({ "queries": [{ "hash": "abcd", "query": ALLOWED_QUERY }] })
+                .to_string(),
+        )
+        .unwrap();
+        for path in [bad, mismatched] {
+            let block = serde_json::json!({
+                "persisted_queries": { "enabled": true, "allowlist_file": path.display().to_string() }
+            });
+            assert!(!agent.on_configure(block, None).await, "{}", path.display());
+            assert!(allowed(&agent).await);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_configure_keeps_file_values() {
         let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
