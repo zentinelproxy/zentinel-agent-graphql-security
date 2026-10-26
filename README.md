@@ -52,7 +52,8 @@ upstreams {
     }
 }
 
-// Request bodies reach agents only with body inspection switched on.
+// Zentinel releases up to 26.10_7 send request bodies to agents only with
+// body inspection switched on; 26.10_8 and later send them without this block.
 waf {
     mode "off"
     body-inspection {
@@ -110,7 +111,8 @@ Downloads the release binary pinned in Zentinel's bundle lock and installs it as
 > 0.2.0`): it speaks the removed v1 framing on the Unix socket, so the proxy
 > never completes a handshake and, under `failure-mode "closed"`, refuses every
 > request (`503`). Use `0.5.0` or later, the first release built and
-> smoke-tested by the shared release pipeline (below).
+> smoke-tested by the shared release pipeline (below); Zentinel 26.10_8's
+> bundle lock (`26.10_02`) pins `0.5.0`.
 
 ### Release binaries
 
@@ -141,7 +143,7 @@ Configuration file keys. Every section and key is optional. An unknown key is an
 | Option | Default | Meaning |
 |---|---|---|
 | `settings.max_body_size` | `1048576` | Larger bodies are rejected with `INVALID_REQUEST`. |
-| `settings.debug_headers` | `false` | Add `X-GraphQL-Depth`, `-Complexity`, `-Aliases`, `-Operations` and `-Fields` to the response. Zentinel 0.6.50 drops headers sent from the body phase, so these do not arrive. |
+| `settings.debug_headers` | `false` | Add `X-GraphQL-Depth`, `-Complexity`, `-Aliases`, `-Operations` and `-Fields` to the response. Zentinel releases up to 26.10_7 drop headers sent from the body phase; from 26.10_8 they reach the client on allowed requests (not on a block, see [How it works](#how-it-works)). |
 | `settings.fail_action` | `block` | `block` answers with the errors body; `allow` only logs violations. |
 | `depth.enabled` | `true` | Enable depth limiting. |
 | `depth.max_depth` | `10` | Maximum selection nesting, following fragments (cycles are cut). |
@@ -176,11 +178,11 @@ The agent always hashes the query text it received itself; the client's `extensi
 
 ### Configuration from Zentinel
 
-Zentinel releases that include zentinelproxy/zentinel#603 send the agent's `config { }` block on every connection: once for each pooled connection at startup, and again on every reconnect. The block uses the same keys as the file (snake_case, nested by section) and is applied by one rule:
+Zentinel 26.10_8 and later send the agent's `config { }` block on every connection: once for each pooled connection at startup, and again on every reconnect (releases up to 0.6.50 never delivered it). Over the Unix socket any build receives it; over gRPC only a build against `zentinel-agent-protocol` 0.6.51 or later does (the lockfile pins 0.6.50, whose gRPC server drops the Configure). The block uses the same keys as the file (snake_case, nested by section) and is applied by one rule:
 
 - **Merge, don't replace.** The block is laid over the file (or the defaults when there is no file). Sections and keys it leaves out keep their file value; a map such as `complexity.field_costs` gains or changes the entries the block names. A list (`list_size_arguments`, `allowed_clients`, `field_auth.rules`) is replaced as a whole. The same block always yields the same settings.
 - **Idempotent.** A block identical to the one already applied (compared by a hash of its canonical JSON), or one that changes nothing, keeps the running analyzers. When it changes settings, the persisted-query analyzer and its loaded allowlist are kept unless `persisted_queries` itself changed; a changed `persisted_queries` reloads the allowlist file.
-- **Strict.** An unknown key, a value of the wrong type, a blank list entry or an allowlist file that cannot be read rejects the whole block: the agent answers the Configure with failure, keeps its current settings and logs the reason. A single value where a list is expected is a one-item list (that is how Zentinel encodes a KDL node with one argument).
+- **Strict.** An unknown key, a value of the wrong type, a blank list entry or an allowlist file that cannot be read rejects the whole block: the agent answers the Configure with failure, keeps its current settings and logs the reason; Zentinel then does not use the agent (the connection fails with an ERROR log and is retried) and its filters' `failure-mode` applies meanwhile. A single value where a list is expected is a one-item list (that is how Zentinel encodes a KDL node with one argument).
 - **No secrets in logs.** The agent logs the block's hash and the dotted names of the settings that changed, never the block itself.
 
 ```kdl
@@ -197,9 +199,9 @@ Full reference: <https://registry.zentinelproxy.io/graphql-security/>
 
 ## How it works
 
-- **Body only.** The headers event is always answered with "allow, send the body"; analysis runs on the final body chunk, with the headers and client address the agent kept from the headers event (the client address is the one Zentinel reports, not a forwarding header). Subscribe the agent to `request_headers` as well as `request_body`; a body whose headers event the agent did not see is analyzed with no headers, so allowlists and field rules deny. `GET` requests with the query in the URL are not inspected, and the proxy only sends bodies when `waf { body-inspection { inspect-request-body #true } }` is set and the content type matches. Use `request-body-mode "buffer"` and a `max-inspection-bytes` at least as large as `settings.max_body_size`: the agent analyzes only the last chunk it receives, and a body cut off at the inspection limit is allowed without analysis.
+- **Body only.** The headers event is always answered with "allow, send the body"; analysis runs on the final body chunk, with the headers and client address the agent kept from the headers event (the client address is the one Zentinel reports, not a forwarding header). Subscribe the agent to `request_headers` as well as `request_body`; a body whose headers event the agent did not see is analyzed with no headers, so allowlists and field rules deny. `GET` requests with the query in the URL are not inspected, and Zentinel releases up to 26.10_7 only send bodies when `waf { body-inspection { inspect-request-body #true } }` is set and the content type matches (26.10_8 and later send them without a `waf` block, every content type included, unless `inspect-request-body #false` is set). Use `request-body-mode "buffer"` and a `max-inspection-bytes` at least as large as `settings.max_body_size`: the agent analyzes only the last chunk it receives, and a body cut off at the inspection limit is allowed without analysis.
 - **Analyzers:** depth, complexity, aliases, batch (JSON array of operations), introspection, field rules and persisted queries. Every operation in a batch is analyzed, and all violations are reported together.
-- **Block response:** status 200 and `{"errors":[{"message", "extensions":{"code","zentinel":true, "actual", "max", "field"}}]}`. Codes: `DEPTH_EXCEEDED`, `COMPLEXITY_EXCEEDED`, `TOO_MANY_ALIASES`, `TOO_MANY_BATCH_QUERIES`, `INTROSPECTION_BLOCKED`, `FIELD_UNAUTHORIZED`, `QUERY_NOT_ALLOWED`, `PERSISTED_QUERY_NOT_FOUND`, `PARSE_ERROR`, `INVALID_REQUEST` (not JSON, no `query` and no persisted-query hash, or too large). The agent asks for `Content-Type: application/json` as a response-header operation, which Zentinel 0.6.50 does not apply to a block decided on the body.
+- **Block response:** status 200 and `{"errors":[{"message", "extensions":{"code","zentinel":true, "actual", "max", "field"}}]}`. Codes: `DEPTH_EXCEEDED`, `COMPLEXITY_EXCEEDED`, `TOO_MANY_ALIASES`, `TOO_MANY_BATCH_QUERIES`, `INTROSPECTION_BLOCKED`, `FIELD_UNAUTHORIZED`, `QUERY_NOT_ALLOWED`, `PERSISTED_QUERY_NOT_FOUND`, `PARSE_ERROR`, `INVALID_REQUEST` (not JSON, no `query` and no persisted-query hash, or too large). The agent asks for `Content-Type: application/json` as a response-header operation, which Zentinel does not apply to a block decided on the body (0.6.50 and 26.10_8 alike: a block response carries only the headers inside the block decision itself).
 - **Complexity** is an estimate without a schema: each field costs its configured cost, and the fields under it are multiplied by its list-size argument or `default_list_multiplier`. Multipliers apply one level down and do not compound.
 - **Metrics** over the agent protocol: `graphql_security_requests_total`, `graphql_security_requests_blocked_total`, `graphql_security_block_rate_percent`.
 
@@ -248,14 +250,14 @@ so the upstream sees the start of a blocked request either way.
 > Zentinel releases up to 26.10_7 send a request body to an agent only when
 > the configuration also has a `waf { }` block; without one this agent sees
 > headers only and blocks nothing. The smoke test reports that as a known
-> limitation for those releases and requires the blocks against anything
-> newer (Zentinel `main` passes).
+> limitation for those releases; against 26.10_8 and later the body checks
+> run for real and the blocks are required.
 
 Run it locally:
 
 ```bash
-gh release download 26.10_7 --repo zentinelproxy/zentinel --pattern 'zentinel-26.10_7-darwin-arm64.tar.gz*'
-shasum -a 256 -c zentinel-26.10_7-darwin-arm64.tar.gz.sha256 && tar xzf zentinel-26.10_7-darwin-arm64.tar.gz
+gh release download 26.10_8 --repo zentinelproxy/zentinel --pattern 'zentinel-26.10_8-darwin-arm64.tar.gz*'
+shasum -a 256 -c zentinel-26.10_8-darwin-arm64.tar.gz.sha256 && tar xzf zentinel-26.10_8-darwin-arm64.tar.gz
 cargo build --release --locked
 AGENT_SMOKE=../.github/agent-smoke/smoke.py scripts/smoke-test.sh target/release/zentinel-graphql-security-agent ./zentinel
 ```
