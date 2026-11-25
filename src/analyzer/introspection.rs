@@ -5,7 +5,7 @@
 use super::{AnalysisContext, AnalysisResult, Analyzer};
 use crate::config::IntrospectionConfig;
 use crate::error::Violation;
-use crate::parser::{FragmentInfo, ParsedDocument};
+use crate::parser::{spread_name, ParsedDocument};
 use apollo_parser::cst;
 use async_trait::async_trait;
 use ipnet::IpNet;
@@ -57,11 +57,14 @@ impl IntrospectionAnalyzer {
     }
 
     /// Check if a selection set contains introspection fields.
+    ///
+    /// `fragments_with_introspection` says for each fragment already checked
+    /// whether it contains introspection fields; a spread contains them if its
+    /// fragment does.
     fn contains_introspection(
         &self,
         selection_set: &cst::SelectionSet,
-        fragments: &HashMap<String, FragmentInfo>,
-        visited_fragments: &mut HashSet<String>,
+        fragments_with_introspection: &HashMap<&str, bool>,
     ) -> bool {
         for selection in selection_set.selections() {
             match selection {
@@ -78,36 +81,22 @@ impl IntrospectionAnalyzer {
 
                     // Recurse into nested selection set
                     if let Some(ss) = field.selection_set() {
-                        if self.contains_introspection(&ss, fragments, visited_fragments) {
+                        if self.contains_introspection(&ss, fragments_with_introspection) {
                             return true;
                         }
                     }
                 }
                 cst::Selection::FragmentSpread(spread) => {
-                    if let Some(name) = spread.fragment_name() {
-                        if let Some(name_token) = name.name() {
-                            let frag_name = name_token.text().to_string();
-
-                            // Prevent infinite recursion
-                            if visited_fragments.contains(&frag_name) {
-                                continue;
-                            }
-
-                            visited_fragments.insert(frag_name.clone());
-                            if self.check_fragment_introspection(
-                                &frag_name,
-                                fragments,
-                                visited_fragments,
-                            ) {
-                                return true;
-                            }
-                            visited_fragments.remove(&frag_name);
-                        }
+                    let in_fragment = spread_name(&spread)
+                        .and_then(|name| fragments_with_introspection.get(name.as_str()).copied())
+                        .unwrap_or(false);
+                    if in_fragment {
+                        return true;
                     }
                 }
                 cst::Selection::InlineFragment(inline) => {
                     if let Some(ss) = inline.selection_set() {
-                        if self.contains_introspection(&ss, fragments, visited_fragments) {
+                        if self.contains_introspection(&ss, fragments_with_introspection) {
                             return true;
                         }
                     }
@@ -127,35 +116,6 @@ impl IntrospectionAnalyzer {
 
         // Block all other __ prefixed fields (__schema, __type)
         name.starts_with("__")
-    }
-
-    /// Check if a fragment contains introspection.
-    fn check_fragment_introspection(
-        &self,
-        fragment_name: &str,
-        fragments: &HashMap<String, FragmentInfo>,
-        visited_fragments: &mut HashSet<String>,
-    ) -> bool {
-        if let Some(frag_info) = fragments.get(fragment_name) {
-            if !frag_info.selection_set_text.is_empty() {
-                let query = format!("{{ {} }}", frag_info.selection_set_text);
-                let parser = apollo_parser::Parser::new(&query);
-                let cst = parser.parse();
-
-                if cst.errors().len() == 0 {
-                    for def in cst.document().definitions() {
-                        if let cst::Definition::OperationDefinition(op) = def {
-                            if let Some(ss) = op.selection_set() {
-                                if self.contains_introspection(&ss, fragments, visited_fragments) {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
     }
 
     /// Check if the client is allowed to introspect.
@@ -197,16 +157,18 @@ impl Analyzer for IntrospectionAnalyzer {
     async fn analyze(&self, document: &ParsedDocument, ctx: &AnalysisContext) -> AnalysisResult {
         let mut has_introspection = false;
 
+        let fragments_with_introspection = document.fold_fragments(|fragment, checked| {
+            fragment
+                .selection_set
+                .as_ref()
+                .is_some_and(|ss| self.contains_introspection(ss, checked))
+        });
+
         // Check each operation for introspection
         for definition in document.document.definitions() {
             if let cst::Definition::OperationDefinition(op) = definition {
                 if let Some(selection_set) = op.selection_set() {
-                    let mut visited = HashSet::new();
-                    if self.contains_introspection(
-                        &selection_set,
-                        &document.fragments,
-                        &mut visited,
-                    ) {
+                    if self.contains_introspection(&selection_set, &fragments_with_introspection) {
                         has_introspection = true;
                         break;
                     }
@@ -443,6 +405,106 @@ mod tests {
         );
 
         let result = analyzer.analyze(&doc, &ctx).await;
+
+        assert!(result.has_violations());
+    }
+
+    /// Whether the default test configuration refuses `query`.
+    async fn introspection_blocked_in(query: &str) -> bool {
+        let analyzer = IntrospectionAnalyzer::new(test_config());
+        let doc = parse_query(query).unwrap();
+        analyzer
+            .analyze(&doc, &test_context())
+            .await
+            .has_violations()
+    }
+
+    #[tokio::test]
+    async fn test_introspection_in_named_fragment_blocked() {
+        let with_fragment = introspection_blocked_in(
+            "{ ...F } fragment F on Query { __schema { types { name } } }",
+        )
+        .await;
+        let inline = introspection_blocked_in("{ __schema { types { name } } }").await;
+
+        assert!(inline);
+        assert_eq!(with_fragment, inline);
+    }
+
+    #[tokio::test]
+    async fn test_introspection_in_nested_named_fragment_blocked() {
+        assert!(
+            introspection_blocked_in(
+                "{ users { ...A } } \
+                 fragment A on User { ...B } \
+                 fragment B on User { __type(name: \"User\") { name } }"
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_introspection_in_fragment_spread_inside_inline_fragment_blocked() {
+        assert!(
+            introspection_blocked_in(
+                "{ users { ... on User { ...F } } } fragment F on User { __schema { types { name } } }"
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_introspection_in_fragment_field_blocked() {
+        assert!(
+            introspection_blocked_in(
+                "{ ...F } fragment F on Query { users { ... on User { __schema { queryType { name } } } } }"
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_without_introspection_passes() {
+        assert!(!introspection_blocked_in("{ ...F } fragment F on Query { users { id } }").await);
+    }
+
+    #[tokio::test]
+    async fn test_typename_in_named_fragment_follows_allow_typename() {
+        let query = "{ users { ...F } } fragment F on User { __typename id }";
+        assert!(!introspection_blocked_in(query).await);
+
+        let mut config = test_config();
+        config.allow_typename = false;
+        let analyzer = IntrospectionAnalyzer::new(config);
+        let doc = parse_query(query).unwrap();
+        assert!(analyzer
+            .analyze(&doc, &test_context())
+            .await
+            .has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_introspection_found_through_repeated_spread_chain() {
+        let query = crate::analyzer::doubling_fragment_chain(40, "__schema { types { name } }");
+        assert!(introspection_blocked_in(&query).await);
+    }
+
+    #[tokio::test]
+    async fn test_introspection_found_at_the_end_of_a_long_fragment_chain() {
+        let query = crate::analyzer::linear_fragment_chain(5_000, "__schema { types { name } }");
+        assert!(introspection_blocked_in(&query).await);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_cycle_in_a_document_that_was_not_checked_ends() {
+        let doc = crate::parser::parse_query_unchecked(
+            "{ ...Alpha } \
+             fragment Alpha on Query { __schema { types { name } } ...Beta } \
+             fragment Beta on Query { ...Alpha }",
+        );
+        let result = IntrospectionAnalyzer::new(test_config())
+            .analyze(&doc, &test_context())
+            .await;
 
         assert!(result.has_violations());
     }

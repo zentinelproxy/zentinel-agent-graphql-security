@@ -1090,6 +1090,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_named_fragment_depth_is_enforced() {
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        let query = "{ users { ...F } } fragment F on User { a { b { c { d { e { f } } } } } }";
+
+        let result = agent
+            .analyze_request(
+                &body(serde_json::json!({ "query": query })),
+                &HashMap::new(),
+                "t",
+                "127.0.0.1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.violations[0].code,
+            crate::error::ViolationCode::DepthExceeded
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fragment_cycle_is_rejected_with_field_rules_enabled() {
+        let mut config = test_config();
+        config.field_auth.enabled = true;
+        config.field_auth.rules = vec![crate::config::FieldAuthRule {
+            fields: vec!["Query.adminStats".to_string()],
+            require_roles: vec!["admin".to_string()],
+            roles_header: None,
+            require_scopes: vec![],
+            scopes_header: None,
+        }];
+        let agent = GraphQLSecurityAgent::new(config).unwrap();
+        let query = "{ ...Alpha } fragment Alpha on Query { ...Beta } fragment Beta on Query { adminStats ...Alpha }";
+
+        // If the cycle check regresses, the field rules recurse until the
+        // stack overflows: the test run aborts instead of reporting a failure.
+
+        let err = agent
+            .analyze_request(
+                &body(serde_json::json!({ "query": query })),
+                &HashMap::new(),
+                "t",
+                "127.0.0.1",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, crate::error::ViolationCode::InvalidRequest);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fragment_cycle_follows_fail_action_like_other_invalid_requests() {
+        let query =
+            "{ ...Alpha } fragment Alpha on Query { ...Beta } fragment Beta on Query { ...Alpha }";
+
+        let agent = GraphQLSecurityAgent::new(test_config()).unwrap();
+        assert!(send(&agent, "block", "203.0.113.9", &[], query).await);
+
+        let mut config = test_config();
+        config.settings.fail_action = FailAction::Allow;
+        let agent = GraphQLSecurityAgent::new(config).unwrap();
+        assert!(!send(&agent, "allow", "203.0.113.9", &[], query).await);
+        // A query that does not parse is treated the same way.
+        assert!(!send(&agent, "parse", "203.0.113.9", &[], "{ users { id ").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_body_without_headers_event_fails_closed() {
         let mut config = test_config();
         config.introspection.allowed_clients = vec!["let-me-in".to_string()];

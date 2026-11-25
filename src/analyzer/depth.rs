@@ -5,10 +5,10 @@
 use super::{AnalysisContext, AnalysisMetrics, AnalysisResult, Analyzer};
 use crate::config::DepthConfig;
 use crate::error::Violation;
-use crate::parser::{FragmentInfo, ParsedDocument};
+use crate::parser::{spread_name, ParsedDocument};
 use apollo_parser::cst;
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::debug;
 
 /// Analyzer that limits query depth.
@@ -23,11 +23,13 @@ impl DepthAnalyzer {
     }
 
     /// Calculate the maximum depth of a selection set.
+    ///
+    /// `fragment_depths` holds the depth of each fragment already worked out;
+    /// a spread is as deep as its fragment.
     fn calculate_depth(
         &self,
         selection_set: &cst::SelectionSet,
-        fragments: &HashMap<String, FragmentInfo>,
-        visited_fragments: &mut HashSet<String>,
+        fragment_depths: &HashMap<&str, u32>,
     ) -> u32 {
         let mut max_depth = 0;
 
@@ -45,39 +47,17 @@ impl DepthAnalyzer {
                     } else {
                         let nested_depth = field
                             .selection_set()
-                            .map(|ss| self.calculate_depth(&ss, fragments, visited_fragments))
+                            .map(|ss| self.calculate_depth(&ss, fragment_depths))
                             .unwrap_or(0);
                         1 + nested_depth
                     }
                 }
-                cst::Selection::FragmentSpread(spread) => {
-                    if let Some(name) = spread.fragment_name() {
-                        if let Some(name_token) = name.name() {
-                            let frag_name = name_token.text().to_string();
-
-                            // Prevent infinite recursion from circular fragments
-                            if visited_fragments.contains(&frag_name) {
-                                0
-                            } else {
-                                visited_fragments.insert(frag_name.clone());
-                                let depth = self.calculate_fragment_depth(
-                                    &frag_name,
-                                    fragments,
-                                    visited_fragments,
-                                );
-                                visited_fragments.remove(&frag_name);
-                                depth
-                            }
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                }
+                cst::Selection::FragmentSpread(spread) => spread_name(&spread)
+                    .and_then(|name| fragment_depths.get(name.as_str()).copied())
+                    .unwrap_or(0),
                 cst::Selection::InlineFragment(inline) => inline
                     .selection_set()
-                    .map(|ss| self.calculate_depth(&ss, fragments, visited_fragments))
+                    .map(|ss| self.calculate_depth(&ss, fragment_depths))
                     .unwrap_or(0),
             };
 
@@ -85,35 +65,6 @@ impl DepthAnalyzer {
         }
 
         max_depth
-    }
-
-    /// Calculate depth through a fragment.
-    fn calculate_fragment_depth(
-        &self,
-        fragment_name: &str,
-        fragments: &HashMap<String, FragmentInfo>,
-        visited_fragments: &mut HashSet<String>,
-    ) -> u32 {
-        if let Some(frag_info) = fragments.get(fragment_name) {
-            // Re-parse the fragment's selection set to calculate depth
-            if !frag_info.selection_set_text.is_empty() {
-                // Wrap in a query to make it parseable
-                let query = format!("{{ {} }}", frag_info.selection_set_text);
-                let parser = apollo_parser::Parser::new(&query);
-                let cst = parser.parse();
-
-                if cst.errors().len() == 0 {
-                    for def in cst.document().definitions() {
-                        if let cst::Definition::OperationDefinition(op) = def {
-                            if let Some(ss) = op.selection_set() {
-                                return self.calculate_depth(&ss, fragments, visited_fragments);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        0
     }
 }
 
@@ -131,13 +82,19 @@ impl Analyzer for DepthAnalyzer {
     async fn analyze(&self, document: &ParsedDocument, ctx: &AnalysisContext) -> AnalysisResult {
         let mut max_depth: u32 = 0;
 
+        let fragment_depths = document.fold_fragments(|fragment, depths| {
+            fragment
+                .selection_set
+                .as_ref()
+                .map(|ss| self.calculate_depth(ss, depths))
+                .unwrap_or(0)
+        });
+
         // Analyze each operation in the document
         for definition in document.document.definitions() {
             if let cst::Definition::OperationDefinition(op) = definition {
                 if let Some(selection_set) = op.selection_set() {
-                    let mut visited = HashSet::new();
-                    let depth =
-                        self.calculate_depth(&selection_set, &document.fragments, &mut visited);
+                    let depth = self.calculate_depth(&selection_set, &fragment_depths);
                     max_depth = max_depth.max(depth);
                 }
             }
@@ -276,5 +233,94 @@ mod tests {
         // users(1) -> inline fragment(0) -> posts(1) -> title(1) = 3
         // The inline fragment doesn't add depth, but the nested fields do
         assert_eq!(result.metrics.depth, Some(3));
+    }
+
+    /// Depth of `query` under the test limit.
+    async fn depth_of(query: &str) -> AnalysisResult {
+        let analyzer = DepthAnalyzer::new(test_config());
+        let doc = parse_query(query).unwrap();
+        analyzer.analyze(&doc, &test_context()).await
+    }
+
+    #[tokio::test]
+    async fn test_named_fragment_depth_matches_inline() {
+        let with_fragment = depth_of(
+            "{ users { ...UserFields } } \
+             fragment UserFields on User { posts { comments { author { friends { name } } } } }",
+        )
+        .await;
+        let inline =
+            depth_of("{ users { posts { comments { author { friends { name } } } } } }").await;
+
+        assert_eq!(inline.metrics.depth, Some(6));
+        assert_eq!(with_fragment.metrics.depth, inline.metrics.depth);
+        assert_eq!(
+            with_fragment.violations[0].code,
+            crate::error::ViolationCode::DepthExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nested_named_fragment_depth() {
+        let result = depth_of(
+            "{ a { ...A } } \
+             fragment A on T { b { ...B } } \
+             fragment B on T { c { d { e { f } } } }",
+        )
+        .await;
+
+        assert_eq!(result.metrics.depth, Some(6));
+        assert!(result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_spread_inside_inline_fragment_depth() {
+        let result = depth_of(
+            "{ a { ... on T { ...F } } } \
+             fragment F on T { b { c { d { e { f } } } } }",
+        )
+        .await;
+
+        assert_eq!(result.metrics.depth, Some(6));
+        assert!(result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_shallow_named_fragment_is_within_limit() {
+        let result = depth_of("{ a { ...F } } fragment F on T { b { c } }").await;
+
+        assert_eq!(result.metrics.depth, Some(3));
+        assert!(!result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_fragment_adds_no_depth() {
+        let result = depth_of("{ a { ...Missing } }").await;
+
+        assert_eq!(result.metrics.depth, Some(1));
+        assert!(!result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_repeated_spreads_do_not_multiply_depth() {
+        let query = crate::analyzer::doubling_fragment_chain(40, "a { b }");
+        let result = depth_of(&query).await;
+
+        assert_eq!(result.metrics.depth, Some(2));
+        assert!(!result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_fragment_cycle_in_a_document_that_was_not_checked_ends() {
+        let doc = crate::parser::parse_query_unchecked(
+            "{ ...Alpha } \
+             fragment Alpha on Query { a { b } ...Beta } \
+             fragment Beta on Query { c ...Alpha }",
+        );
+        let result = DepthAnalyzer::new(test_config())
+            .analyze(&doc, &test_context())
+            .await;
+
+        assert_eq!(result.metrics.depth, Some(2));
     }
 }

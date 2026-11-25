@@ -53,8 +53,15 @@ impl FieldAuthAnalyzer {
     }
 
     /// Get all fields from the document.
-    fn extract_all_fields(&self, document: &ParsedDocument) -> Vec<FieldInfo> {
+    ///
+    /// The returned fields are those of each operation and of each fragment an
+    /// operation spreads, the fields of a fragment once however often it is
+    /// spread. The count is the number of fields the operations would have if
+    /// every spread were replaced by its fragment's selections.
+    fn extract_all_fields(&self, document: &ParsedDocument) -> (Vec<FieldInfo>, u64) {
         let mut fields = Vec::new();
+        let mut field_count: u64 = 0;
+        let mut operations = Vec::new();
 
         for definition in document.document.definitions() {
             if let cst::Definition::OperationDefinition(op) = definition {
@@ -73,16 +80,36 @@ impl FieldAuthAnalyzer {
                     .unwrap_or("Query");
 
                 if let Some(selection_set) = op.selection_set() {
-                    fields.extend(extract_fields(
-                        &selection_set,
-                        &document.fragments,
-                        Some(root_type),
-                    ));
+                    let operation_fields = extract_fields(&selection_set, Some(root_type));
+                    field_count = field_count.saturating_add(operation_fields.len() as u64);
+                    fields.extend(operation_fields);
+                    operations.push(selection_set);
                 }
             }
         }
 
-        fields
+        let fragment_uses = document.fragment_uses(&operations);
+        for name in &document.fragment_order {
+            let times = fragment_uses.get(name.as_str()).copied().unwrap_or(0);
+            if times == 0 {
+                continue;
+            }
+            if let Some((selection_set, type_condition)) =
+                document.fragments.get(name).and_then(|fragment| {
+                    fragment
+                        .selection_set
+                        .as_ref()
+                        .map(|ss| (ss, &fragment.type_condition))
+                })
+            {
+                let fragment_fields = extract_fields(selection_set, Some(type_condition));
+                field_count =
+                    field_count.saturating_add(times.saturating_mul(fragment_fields.len() as u64));
+                fields.extend(fragment_fields);
+            }
+        }
+
+        (fields, field_count)
     }
 
     /// Check if a field matches a rule.
@@ -181,7 +208,7 @@ impl Analyzer for FieldAuthAnalyzer {
         }
 
         // Extract all fields from the query
-        let fields = self.extract_all_fields(document);
+        let (fields, field_count) = self.extract_all_fields(document);
 
         let mut violations = Vec::new();
         let mut checked_fields = HashSet::new();
@@ -218,13 +245,13 @@ impl Analyzer for FieldAuthAnalyzer {
         }
 
         let metrics = AnalysisMetrics {
-            fields: Some(fields.len() as u32),
+            fields: Some(u32::try_from(field_count).unwrap_or(u32::MAX)),
             ..Default::default()
         };
 
         debug!(
             correlation_id = %ctx.correlation_id,
-            total_fields = fields.len(),
+            total_fields = field_count,
             violations = violations.len(),
             "Field auth analysis complete"
         );
@@ -411,5 +438,154 @@ mod tests {
         let result = analyzer.analyze(&doc, &ctx).await;
 
         assert!(!result.has_violations());
+    }
+
+    fn admin_analyzer() -> FieldAuthAnalyzer {
+        FieldAuthAnalyzer::new(test_config_with_rules(vec![admin_rule()]))
+    }
+
+    async fn field_auth_result(analyzer: &FieldAuthAnalyzer, query: &str) -> AnalysisResult {
+        let doc = parse_query(query).unwrap();
+        analyzer.analyze(&doc, &test_context()).await
+    }
+
+    #[tokio::test]
+    async fn test_protected_field_in_named_fragment() {
+        let result = field_auth_result(
+            &admin_analyzer(),
+            "{ ...F } fragment F on Query { adminUsers { id } }",
+        )
+        .await;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(
+            result.violations[0].code,
+            crate::error::ViolationCode::FieldUnauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn test_protected_field_in_nested_named_fragment() {
+        let result = field_auth_result(
+            &admin_analyzer(),
+            "{ ...A } \
+             fragment A on Query { ... on Query { ...B } } \
+             fragment B on Query { id adminNotes }",
+        )
+        .await;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(
+            result.violations[0].code,
+            crate::error::ViolationCode::FieldUnauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn test_protected_field_in_named_fragment_with_role() {
+        let analyzer = admin_analyzer();
+        let doc = parse_query("{ ...F } fragment F on Query { adminUsers { id } }").unwrap();
+        let mut ctx = test_context();
+        ctx.headers
+            .insert("x-user-roles".to_string(), vec!["admin".to_string()]);
+
+        assert!(!analyzer.analyze(&doc, &ctx).await.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_unprotected_named_fragment_passes() {
+        let result = field_auth_result(
+            &admin_analyzer(),
+            "{ ...F } fragment F on Query { users { id name } }",
+        )
+        .await;
+
+        assert!(!result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_fragment_adds_no_fields() {
+        let result = field_auth_result(&admin_analyzer(), "{ users { ...Missing } }").await;
+
+        assert!(!result.has_violations());
+        assert_eq!(result.metrics.fields, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_repeated_spreads_are_counted_in_the_field_metric() {
+        let result = field_auth_result(
+            &admin_analyzer(),
+            "{ ...F ...F } fragment F on Query { users { id } adminUsers }",
+        )
+        .await;
+
+        // users, id, adminUsers, twice; the protected field is reported once.
+        assert_eq!(result.metrics.fields, Some(6));
+        assert_eq!(result.violations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_spread_chain_reports_field_once() {
+        // 2^29 copies of the protected field.
+        let query = crate::analyzer::doubling_fragment_chain(30, "adminTotals");
+        let result = field_auth_result(&admin_analyzer(), &query).await;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.metrics.fields, Some(1 << 29));
+    }
+
+    #[tokio::test]
+    async fn test_field_count_saturates_instead_of_wrapping() {
+        let query = crate::analyzer::doubling_fragment_chain(40, "adminTotals");
+        let result = field_auth_result(&admin_analyzer(), &query).await;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.metrics.fields, Some(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn test_fragment_cycle_in_a_document_that_was_not_checked_ends() {
+        let doc = crate::parser::parse_query_unchecked(
+            "{ ...Alpha } \
+             fragment Alpha on Query { adminStats ...Beta } \
+             fragment Beta on Query { ...Alpha }",
+        );
+        let result = admin_analyzer().analyze(&doc, &test_context()).await;
+
+        assert_eq!(result.violations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_type_rule_matches_fields_of_a_fragment_on_that_type() {
+        let rule = FieldAuthRule {
+            fields: vec!["User.email".to_string()],
+            require_roles: vec!["admin".to_string()],
+            roles_header: None,
+            require_scopes: Vec::new(),
+            scopes_header: None,
+        };
+        let analyzer = FieldAuthAnalyzer::new(test_config_with_rules(vec![rule]));
+        let doc = parse_query("{ user { ...F } } fragment F on User { email }").unwrap();
+
+        let result = analyzer.analyze(&doc, &test_context()).await;
+        assert_eq!(result.violations.len(), 1);
+        assert!(result.violations[0].message.contains("User.email"));
+
+        let mut ctx = test_context();
+        ctx.headers
+            .insert("x-user-roles".to_string(), vec!["admin".to_string()]);
+        assert!(!analyzer.analyze(&doc, &ctx).await.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_fragment_spread_by_two_operations_is_checked_and_counted_for_each() {
+        let result = field_auth_result(
+            &admin_analyzer(),
+            "query One { ...F } query Two { ...F } fragment F on Query { adminUsers }",
+        )
+        .await;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.metrics.fields, Some(2));
     }
 }
