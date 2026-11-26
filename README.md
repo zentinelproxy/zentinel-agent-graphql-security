@@ -114,6 +114,13 @@ Downloads the release binary pinned in Zentinel's bundle lock and installs it as
 > smoke-tested by the shared release pipeline (below); Zentinel 26.10_8's
 > bundle lock (`26.10_02`) pins `0.5.0`.
 
+> [!WARNING]
+> Up to `0.5.0`, depth, complexity, alias and introspection checks ignored the
+> selections inside named fragments, so a query moved into a fragment passed
+> those limits, and fragments that spread each other in a cycle exhausted the
+> agent's stack when field rules were enabled. Fixed in `0.6.0` (#12); use
+> `0.6.0` or later.
+
 ### Release binaries
 
 Tarballs for `linux-x86_64`, `linux-aarch64` and `darwin-aarch64` are attached to each [release](https://github.com/zentinelproxy/zentinel-agent-graphql-security/releases).
