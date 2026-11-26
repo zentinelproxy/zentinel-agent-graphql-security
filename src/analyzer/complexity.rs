@@ -5,11 +5,40 @@
 use super::{AnalysisContext, AnalysisMetrics, AnalysisResult, Analyzer};
 use crate::config::ComplexityConfig;
 use crate::error::Violation;
-use crate::parser::{FragmentInfo, ParsedDocument};
+use crate::parser::{spread_name, ParsedDocument};
 use apollo_parser::cst;
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::debug;
+
+/// The cost of a selection set, split by what the list multiplier of the
+/// field above it applies to.
+///
+/// A field costs its own cost times that multiplier, plus the cost of its
+/// selection set, which carries the multiplier of the field itself. So the
+/// cost of a selection set is linear in the multiplier it is reached with,
+/// and a fragment's cost can be worked out once and used at every spread.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    /// Cost that is multiplied by the multiplier the selection set is reached with
+    scaled: u64,
+    /// Cost that is not
+    fixed: u64,
+}
+
+impl Cost {
+    fn add(&mut self, other: Cost) {
+        self.scaled = self.scaled.saturating_add(other.scaled);
+        self.fixed = self.fixed.saturating_add(other.fixed);
+    }
+
+    /// The cost when reached with `multiplier`. Saturates at `u64::MAX`.
+    fn at(self, multiplier: u64) -> u64 {
+        self.scaled
+            .saturating_mul(multiplier)
+            .saturating_add(self.fixed)
+    }
+}
 
 /// Analyzer that limits query complexity.
 pub struct ComplexityAnalyzer {
@@ -23,18 +52,18 @@ impl ComplexityAnalyzer {
     }
 
     /// Calculate the complexity of a selection set.
+    ///
+    /// `fragment_costs` holds the cost of each fragment already worked out.
     fn calculate_complexity(
         &self,
         selection_set: &cst::SelectionSet,
-        fragments: &HashMap<String, FragmentInfo>,
-        visited_fragments: &mut HashSet<String>,
+        fragment_costs: &HashMap<&str, Cost>,
         parent_type: Option<&str>,
-        parent_multiplier: u64,
-    ) -> u64 {
-        let mut total_complexity: u64 = 0;
+    ) -> Cost {
+        let mut total = Cost::default();
 
         for selection in selection_set.selections() {
-            let complexity = match selection {
+            match selection {
                 cst::Selection::Field(field) => {
                     let field_name = field
                         .name()
@@ -51,44 +80,23 @@ impl ComplexityAnalyzer {
                     let nested_complexity = field
                         .selection_set()
                         .map(|ss| {
-                            self.calculate_complexity(
-                                &ss,
-                                fragments,
-                                visited_fragments,
-                                None, // We don't know the nested type without schema
-                                multiplier,
-                            )
+                            // We don't know the nested type without schema
+                            self.calculate_complexity(&ss, fragment_costs, None)
+                                .at(multiplier)
                         })
                         .unwrap_or(0);
 
-                    // Total: base cost + (nested cost * multiplier)
-                    // Apply parent multiplier to field cost
-                    (field_cost * parent_multiplier) + nested_complexity
+                    // Total: base cost (times the parent multiplier) + (nested cost * multiplier)
+                    total.add(Cost {
+                        scaled: field_cost,
+                        fixed: nested_complexity,
+                    });
                 }
                 cst::Selection::FragmentSpread(spread) => {
-                    if let Some(name) = spread.fragment_name() {
-                        if let Some(name_token) = name.name() {
-                            let frag_name = name_token.text().to_string();
-
-                            // Prevent infinite recursion
-                            if visited_fragments.contains(&frag_name) {
-                                0
-                            } else {
-                                visited_fragments.insert(frag_name.clone());
-                                let complexity = self.calculate_fragment_complexity(
-                                    &frag_name,
-                                    fragments,
-                                    visited_fragments,
-                                    parent_multiplier,
-                                );
-                                visited_fragments.remove(&frag_name);
-                                complexity
-                            }
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
+                    if let Some(cost) =
+                        spread_name(&spread).and_then(|name| fragment_costs.get(name.as_str()))
+                    {
+                        total.add(*cost);
                     }
                 }
                 cst::Selection::InlineFragment(inline) => {
@@ -98,25 +106,18 @@ impl ComplexityAnalyzer {
                         .and_then(|nt| nt.name())
                         .map(|n| n.text().to_string());
 
-                    inline
-                        .selection_set()
-                        .map(|ss| {
-                            self.calculate_complexity(
-                                &ss,
-                                fragments,
-                                visited_fragments,
-                                type_cond.as_deref(),
-                                parent_multiplier,
-                            )
-                        })
-                        .unwrap_or(0)
+                    if let Some(ss) = inline.selection_set() {
+                        total.add(self.calculate_complexity(
+                            &ss,
+                            fragment_costs,
+                            type_cond.as_deref(),
+                        ));
+                    }
                 }
-            };
-
-            total_complexity += complexity;
+            }
         }
 
-        total_complexity
+        total
     }
 
     /// Get the cost for a field.
@@ -177,40 +178,6 @@ impl ComplexityAnalyzer {
         // Default multiplier if no list size argument found
         self.config.default_list_multiplier
     }
-
-    /// Calculate complexity through a fragment.
-    fn calculate_fragment_complexity(
-        &self,
-        fragment_name: &str,
-        fragments: &HashMap<String, FragmentInfo>,
-        visited_fragments: &mut HashSet<String>,
-        parent_multiplier: u64,
-    ) -> u64 {
-        if let Some(frag_info) = fragments.get(fragment_name) {
-            if !frag_info.selection_set_text.is_empty() {
-                let query = format!("{{ {} }}", frag_info.selection_set_text);
-                let parser = apollo_parser::Parser::new(&query);
-                let cst = parser.parse();
-
-                if cst.errors().len() == 0 {
-                    for def in cst.document().definitions() {
-                        if let cst::Definition::OperationDefinition(op) = def {
-                            if let Some(ss) = op.selection_set() {
-                                return self.calculate_complexity(
-                                    &ss,
-                                    fragments,
-                                    visited_fragments,
-                                    Some(&frag_info.type_condition),
-                                    parent_multiplier,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        0
-    }
 }
 
 /// Extract integer value from a CST value.
@@ -235,18 +202,21 @@ impl Analyzer for ComplexityAnalyzer {
     async fn analyze(&self, document: &ParsedDocument, ctx: &AnalysisContext) -> AnalysisResult {
         let mut total_complexity: u64 = 0;
 
+        let fragment_costs = document.fold_fragments(|fragment, costs| {
+            fragment
+                .selection_set
+                .as_ref()
+                .map(|ss| self.calculate_complexity(ss, costs, Some(&fragment.type_condition)))
+                .unwrap_or_default()
+        });
+
         for definition in document.document.definitions() {
             if let cst::Definition::OperationDefinition(op) = definition {
                 if let Some(selection_set) = op.selection_set() {
-                    let mut visited = HashSet::new();
-                    let complexity = self.calculate_complexity(
-                        &selection_set,
-                        &document.fragments,
-                        &mut visited,
-                        None,
-                        1, // Base multiplier
-                    );
-                    total_complexity += complexity;
+                    let complexity = self
+                        .calculate_complexity(&selection_set, &fragment_costs, None)
+                        .at(1); // Base multiplier
+                    total_complexity = total_complexity.saturating_add(complexity);
                 }
             }
         }
@@ -376,5 +346,195 @@ mod tests {
         // users(1) + posts(1*10) + title(1*5) = 16
         // Note: In this simple model, nested multipliers don't compound
         assert_eq!(result.metrics.complexity, Some(16));
+    }
+
+    async fn complexity_of(config: ComplexityConfig, query: &str) -> AnalysisResult {
+        let analyzer = ComplexityAnalyzer::new(config);
+        let doc = parse_query(query).unwrap();
+        analyzer.analyze(&doc, &test_context()).await
+    }
+
+    #[tokio::test]
+    async fn test_named_fragment_complexity_matches_inline() {
+        let with_fragment = complexity_of(
+            test_config(),
+            "{ users { ...F } } fragment F on User { id name }",
+        )
+        .await;
+        let inline = complexity_of(test_config(), "{ users { id name } }").await;
+
+        // users(1) + id(1*10) + name(1*10) = 21
+        assert_eq!(inline.metrics.complexity, Some(21));
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_named_fragment_uses_list_multiplier_of_its_field() {
+        let with_fragment = complexity_of(
+            test_config(),
+            "{ users(first: 5) { ...F } } fragment F on User { id name }",
+        )
+        .await;
+        let inline = complexity_of(test_config(), "{ users(first: 5) { id name } }").await;
+
+        // users(1) + id(1*5) + name(1*5) = 11
+        assert_eq!(inline.metrics.complexity, Some(11));
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_nested_named_fragments_complexity_matches_inline() {
+        let with_fragments = complexity_of(
+            test_config(),
+            "{ ...Q } \
+             fragment Q on Query { users(first: 2) { ...U } } \
+             fragment U on User { id posts { ...P } } \
+             fragment P on Post { title }",
+        )
+        .await;
+        let inline =
+            complexity_of(test_config(), "{ users(first: 2) { id posts { title } } }").await;
+
+        // users(1) + id(1*2) + posts(1*2) + title(1*10) = 15
+        assert_eq!(inline.metrics.complexity, Some(15));
+        assert_eq!(with_fragments.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_spread_inside_inline_fragment_complexity_matches_inline() {
+        let with_fragment = complexity_of(
+            test_config(),
+            "{ users { ... on User { ...F } } } fragment F on User { id }",
+        )
+        .await;
+        let inline = complexity_of(test_config(), "{ users { ... on User { id } } }").await;
+
+        assert_eq!(inline.metrics.complexity, Some(11));
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_type_condition_selects_type_cost() {
+        let mut config = test_config();
+        config.type_costs.insert("User".to_string(), 7);
+        let with_fragment = complexity_of(
+            config.clone(),
+            "{ users { ...F } } fragment F on User { id }",
+        )
+        .await;
+        let inline = complexity_of(config, "{ users { ... on User { id } } }").await;
+
+        // users(1) + id(7*10) = 71
+        assert_eq!(inline.metrics.complexity, Some(71));
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_spreads_are_counted_each_time() {
+        let with_fragment = complexity_of(
+            test_config(),
+            "{ ...F ...F ...F } fragment F on Query { users { id } }",
+        )
+        .await;
+        let inline =
+            complexity_of(test_config(), "{ users { id } users { id } users { id } }").await;
+
+        // 3 * (users(1) + id(1*10)) = 33
+        assert_eq!(inline.metrics.complexity, Some(33));
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_named_fragment_complexity_exceeds_limit() {
+        let mut config = test_config();
+        config.max_complexity = 10;
+        let result = complexity_of(
+            config,
+            "{ users { ...F } } fragment F on User { id name email }",
+        )
+        .await;
+
+        assert_eq!(
+            result.violations[0].code,
+            crate::error::ViolationCode::ComplexityExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_fragment_adds_no_complexity() {
+        let result = complexity_of(test_config(), "{ users { ...Missing } }").await;
+
+        assert_eq!(result.metrics.complexity, Some(1));
+        assert!(!result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn test_repeated_spread_chain_complexity_is_exact() {
+        // 2^29 copies of `a`, each costing 1.
+        let query = crate::analyzer::doubling_fragment_chain(30, "a");
+        let result = complexity_of(test_config(), &query).await;
+
+        assert_eq!(result.metrics.complexity, Some(1 << 29));
+        assert_eq!(
+            result.violations[0].code,
+            crate::error::ViolationCode::ComplexityExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complexity_saturates_instead_of_wrapping() {
+        // 2^69 copies: the count does not fit in 64 bits.
+        let query = crate::analyzer::doubling_fragment_chain(70, "a { b }");
+        let result = complexity_of(test_config(), &query).await;
+
+        assert_eq!(result.metrics.complexity, Some(u64::MAX));
+        assert_eq!(
+            result.violations[0].code,
+            crate::error::ViolationCode::ComplexityExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_cycle_in_a_document_that_was_not_checked_ends() {
+        let doc = crate::parser::parse_query_unchecked(
+            "{ ...Alpha } \
+             fragment Alpha on Query { a ...Beta } \
+             fragment Beta on Query { b ...Alpha }",
+        );
+        let result = ComplexityAnalyzer::new(test_config())
+            .analyze(&doc, &test_context())
+            .await;
+
+        assert!(result.metrics.complexity.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fragment_spread_under_different_multipliers_matches_inline() {
+        let with_fragment = complexity_of(
+            test_config(),
+            "{ a(first: 2) { ...F } b(first: 5) { ...F } } fragment F on T { x y { z } }",
+        )
+        .await;
+        let inline = complexity_of(
+            test_config(),
+            "{ a(first: 2) { x y { z } } b(first: 5) { x y { z } } }",
+        )
+        .await;
+
+        // a(1) + x(1*2) + y(1*2) + z(1*10) = 15, b(1) + x(1*5) + y(1*5) + z(1*10) = 21
+        assert_eq!(inline.metrics.complexity, Some(36));
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_spread_at_root_and_under_a_multiplier_matches_inline() {
+        let with_fragment = complexity_of(
+            test_config(),
+            "{ ...F a(first: 3) { ...F } } fragment F on T { x y { ...G } } fragment G on T { z }",
+        )
+        .await;
+        let inline = complexity_of(test_config(), "{ x y { z } a(first: 3) { x y { z } } }").await;
+
+        assert_eq!(with_fragment.metrics.complexity, inline.metrics.complexity);
     }
 }

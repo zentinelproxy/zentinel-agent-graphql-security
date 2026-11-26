@@ -192,6 +192,35 @@ pub trait Analyzer: Send + Sync {
     }
 }
 
+/// A query whose fragment `F0` spreads `F1` twice, `F1` spreads `F2` twice,
+/// and so on. The last of the `levels` fragments holds `leaf`, so written out
+/// inline the query would contain `2^(levels - 1)` copies of it.
+#[cfg(test)]
+pub(crate) fn doubling_fragment_chain(levels: usize, leaf: &str) -> String {
+    let mut query = String::from("{ ...F0 }");
+    for i in 0..levels - 1 {
+        let next = i + 1;
+        query.push_str(&format!(
+            " fragment F{i} on Query {{ ...F{next} ...F{next} }}"
+        ));
+    }
+    query.push_str(&format!(" fragment F{} on Query {{ {leaf} }}", levels - 1));
+    query
+}
+
+/// A query whose fragments form a single chain of `levels` fragments: `F0`
+/// spreads `F1`, `F1` spreads `F2`, and so on. The last one holds `leaf`.
+#[cfg(test)]
+pub(crate) fn linear_fragment_chain(levels: usize, leaf: &str) -> String {
+    let mut query = String::from("{ ...F0 }");
+    for i in 0..levels - 1 {
+        let next = i + 1;
+        query.push_str(&format!(" fragment F{i} on Query {{ ...F{next} }}"));
+    }
+    query.push_str(&format!(" fragment F{} on Query {{ {leaf} }}", levels - 1));
+    query
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
